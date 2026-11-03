@@ -23,15 +23,6 @@ into a PR per repository. A plugin needs a separate setup in each harness, and a
 new code on every machine that has it. The comparison and the loader's costs are in
 [docs/why-a-loader.md](docs/why-a-loader.md).
 
-## Access while private
-
-This repository is private until the guidance is agreed.
-
-- Only people whose git can authenticate over HTTPS to the `paritytech` GitHub organization without
-  prompting (for example after `gh auth setup-git`) receive the guidance.
-- For everyone else the fetch fails quickly and the session starts without it.
-- Making the repository public needs no downstream change.
-
 ## Installing in a repository
 
 A maintainer runs the installer once per repository. Contributors only need bash and git.
@@ -79,7 +70,7 @@ Hook commands, output shapes and all caveats are in [docs/harnesses.md](docs/har
 |---|---|---|
 | Claude Code | `.claude/settings.json` | None beyond trust on first use |
 | Codex | `.codex/hooks.json` | Hooks need trust in `/hooks`; no SessionStart in Codex Desktop |
-| Gemini CLI | `.gemini/settings.json` | While private: an environment-based credential helper may not reach git (unverified) |
+| Gemini CLI | `.gemini/settings.json` | None beyond trust on first use |
 | Cursor | `.cursor/hooks.json` | `additional_context` may not reach the model (open bugs) |
 | Copilot CLI and cloud agent | `.github/hooks/agent-guidance.json` | Context not confirmed for the cloud agent |
 
@@ -93,7 +84,7 @@ commands, so push access here is high-trust: a change steers the agents of every
 - The loader fetches only text from this repository and never executes a fetched file.
 - Changes to the loader itself reach a repository only when a maintainer re-runs the installer
   there and commits the result.
-- When the GitHub repository is created, set branch protection on `main` to require a reviewed PR.
+- `main` requires a PR with one approving review and passing CI, also for admins.
 
 ## Writing guidance
 
