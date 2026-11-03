@@ -29,7 +29,7 @@ A maintainer runs the installer once per repository. Contributors only need bash
 [docs/installer.md](docs/installer.md) lists what the installer writes, file by file.
 
 ```sh
-cargo install --git https://github.com/paritytech/agent-guidance agent-guidance-install
+cargo install --git https://github.com/paritytech/agent-guidance
 cd path/to/repository
 agent-guidance-install
 ```

@@ -36,8 +36,8 @@ const HARNESSES: [&str; 5] = ["claude", "codex", "gemini", "cursor", "copilot"];
 const FALLBACK: &str = "Company agent guidance could not be fetched for this session. Follow the \
 	agent-guidance instruction in AGENTS.md or CLAUDE.md to read it.";
 /// The steps the out-of-date notice tells the user to take.
-const UPGRADE: &str = "run cargo install --force --git https://github.com/paritytech/agent-guidance \
-	agent-guidance-install, then agent-guidance-install, and commit";
+const UPGRADE: &str = "run cargo install --git https://github.com/paritytech/agent-guidance, \
+	then agent-guidance-install, and commit";
 
 /// Upper bound for a loader run against a network that accepts connections and never answers.
 const HUNG_BUDGET: Duration = Duration::from_secs(6);
