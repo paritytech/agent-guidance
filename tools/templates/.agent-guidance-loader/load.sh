@@ -30,7 +30,7 @@
 # (awk, tr, find, touch); uses python3 for JSON escaping when it is available.
 
 # Must equal the loader-version file at the root of the guidance repository.
-LOADER_VERSION=2
+LOADER_VERSION=3
 
 # fd 3 keeps the real stdout for the JSON object. fd 1 becomes the real stderr,
 # so echo and git output are diagnostics. fd 2 goes to /dev/null: on macOS the
@@ -256,7 +256,6 @@ fi
 # cache, a local operation like the rev-parse calls above; run_git is not used
 # because inside a command substitution job control is off, so its watchdog
 # could not stop git. Anything but a hex string is dropped.
-# shellcheck disable=SC2329 # called through json_string
 status_line() {
 	local message sha=
 	if [ -n "$serve" ]; then
@@ -283,7 +282,6 @@ status_line() {
 	printf 'parity-agent-guidance: %s\n' "$message"
 }
 
-# shellcheck disable=SC2329 # called through json_string
 context() {
 	if [ -n "$serve" ]; then
 		printf "Company agent guidance follows. Files it links to live under \`%s/\`.\n\n" \
@@ -319,11 +317,22 @@ if command -v python3 >/dev/null; then
 	fi
 fi
 
-# Prints the output of the function named $1 as a JSON string.
+# Prints standard input as a JSON string. The input is read once, so the awk
+# escaper can run on it when python fails. The x appended to it keeps the
+# command substitution from removing trailing newlines; tr has removed every
+# NUL byte, which a shell variable cannot hold.
 json_string() {
-	local out=
+	local text out=
+	# In some multibyte locales (GBK, Big5, Shift-JIS) an x can be the second
+	# byte of a character, and ${text%x} would then keep it.
+	local LC_ALL=C
+	text=$(
+		LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
+		printf x
+	)
+	text=${text%x}
 	if [ -n "$use_python" ]; then
-		out=$("$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | python3 -I -c '
+		out=$(printf '%s' "$text" | python3 -I -c '
 import json, sys
 s = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
 if s.endswith("\n"):
@@ -333,7 +342,7 @@ sys.stdout.buffer.write(out.encode("utf-8", "surrogateescape"))
 ') || out=
 	fi
 	if [ -z "$out" ]; then
-		out=$("$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | LC_ALL=C awk '
+		out=$(printf '%s' "$text" | LC_ALL=C awk '
 BEGIN { printf "\"" }
 {
 	if (NR > 1) printf "\\n"
@@ -358,7 +367,7 @@ END { printf "\"" }
 	printf '%s' "$out"
 }
 
-escaped=$(json_string context)
+escaped=$(context | json_string)
 
 # Claude Code, Codex and Gemini CLI show a top-level systemMessage to the user.
 # Cursor and Copilot document no such field, so their output omits it.
@@ -375,7 +384,7 @@ copilot)
 	*) echo "agent-guidance: unknown harness '$harness', printing the Claude Code shape" ;;
 	esac
 	printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":%s},"systemMessage":%s}\n' \
-		"$escaped" "$(json_string status_line)" >&3
+		"$escaped" "$(status_line | json_string)" >&3
 	;;
 esac
 
