@@ -49,5 +49,5 @@ shipping it as a plugin each misses one of these.
 - In Cursor and the Copilot cloud agent the context may not reach the model.
 - The fallback line covers these cases (see [Harnesses](harnesses.md#caveats)).
 - An update reaches the agent in the session after the one that fetched it.
-- The first session needs network access and, while the repository is private, GitHub access.
+- The first session needs network access.
 - Each repository commits the loader once and re-runs the installer when the loader changes.

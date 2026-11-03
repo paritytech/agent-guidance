@@ -72,8 +72,6 @@ goes in the field that the harness shows to the user, where one exists.
 - Hooks run only in trusted folders.
 - The user is warned when a project hook changes.
 - Gemini CLI runs hooks with a sanitized environment.
-  - During the private phase, a git credential helper that depends on environment variables may
-    not reach git. This is not verified.
 
 ### Cursor
 
