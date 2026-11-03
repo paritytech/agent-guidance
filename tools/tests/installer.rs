@@ -471,8 +471,7 @@ fn writes_nothing_over_a_newer_loader() {
 			format!(
 				"error: {LOADER} is loader v{newer}, newer than v{} from this installer.\n\
 				 No file was changed. Update the installer and run it again:\n  \
-				 cargo install --force --git https://github.com/paritytech/agent-guidance \
-				 agent-guidance-install\n",
+				 cargo install --git https://github.com/paritytech/agent-guidance\n",
 				version()
 			)
 		);

@@ -95,9 +95,8 @@ field (see [What reaches the user](harnesses.md#what-reaches-the-user)).
   reach the screen. The stderr diagnostic keeps the full URL.
 - With a fresh cache, a failing background fetch does not show: it ends after the line is printed.
 - When the loader is out of date (see [Loader versions](#loader-versions)), the line ends with
-  `; loader v<N> out of date (v<M> available): run cargo install --force --git
-  https://github.com/paritytech/agent-guidance agent-guidance-install, then agent-guidance-install,
-  and commit`.
+  `; loader v<N> out of date (v<M> available): run cargo install --git
+  https://github.com/paritytech/agent-guidance, then agent-guidance-install, and commit`.
   - `<N>` is the committed loader's version and `<M>` the fetched `loader-version`.
 - The line is escaped the same way as the context.
 
@@ -125,7 +124,7 @@ field (see [What reaches the user](harnesses.md#what-reaches-the-user)).
 - The installer embeds the loader it writes, so the upgrade has two steps. See
   [Upgrading the loader](installer.md#upgrading-the-loader).
   1. Update the installer with
-     `cargo install --force --git https://github.com/paritytech/agent-guidance agent-guidance-install`.
+     `cargo install --git https://github.com/paritytech/agent-guidance`.
   2. Run `agent-guidance-install` in the repository and commit the result.
 - A version bump means every downstream repository has to upgrade and commit the new loader.
   - Until then its sessions show that notice.

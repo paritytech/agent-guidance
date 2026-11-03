@@ -253,8 +253,8 @@ if [ -n "$serve" ]; then
 	esac
 fi
 # The installer embeds the loader it writes, so it has to be updated first.
-upgrade="run cargo install --force --git https://github.com/paritytech/agent-guidance"
-upgrade="$upgrade agent-guidance-install, then agent-guidance-install, and commit"
+upgrade="run cargo install --git https://github.com/paritytech/agent-guidance"
+upgrade="$upgrade, then agent-guidance-install, and commit"
 
 # The status line for the user. The commit comes from git's own records in the
 # cache, a local operation like the rev-parse calls above; run_git is not used

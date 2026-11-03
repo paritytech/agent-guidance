@@ -51,7 +51,7 @@ The installer binary embeds the loader it writes, so an installer built before a
 bump writes the old loader again. Update the installer first, then run it in the repository:
 
 ```sh
-cargo install --force --git https://github.com/paritytech/agent-guidance agent-guidance-install
+cargo install --git https://github.com/paritytech/agent-guidance
 cd path/to/repository
 agent-guidance-install
 ```
@@ -69,8 +69,7 @@ Commit the changed files it lists. The first line of its output reports the load
 - When the existing loader is newer, the installer was built before a version bump, and its hook
   configs may be as old as its loader.
   - It checks this before it writes anything, and then writes no file.
-  - It prints both versions and the `cargo install --force` command to stderr, and exits with
-    status 1.
+  - It prints both versions and the `cargo install` command to stderr, and exits with status 1.
   - A version too large for an integer type counts as newer.
 
 ## After a run

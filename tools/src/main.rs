@@ -24,8 +24,7 @@ const LOADER_PATH: &str = ".agent-guidance-loader/load.sh";
 const LOADER: &str = include_str!("../templates/.agent-guidance-loader/load.sh");
 
 /// Command that updates this installer, and with it the loader it embeds.
-const UPDATE_INSTALLER: &str = "cargo install --force --git \
-	https://github.com/paritytech/agent-guidance agent-guidance-install";
+const UPDATE_INSTALLER: &str = "cargo install --git https://github.com/paritytech/agent-guidance";
 
 /// Hook configs merged into existing files: path, template contents, and event name.
 const HOOK_CONFIGS: [(&str, &str, &str); 4] = [
@@ -76,7 +75,7 @@ Installs the agent guidance loader and hook configs into the repository at ROOT
 (default: the top level of the git repository that contains the current
 directory). To upgrade the loader, update the installer, then run it again:
 
-  cargo install --force --git https://github.com/paritytech/agent-guidance agent-guidance-install";
+  cargo install --git https://github.com/paritytech/agent-guidance";
 
 /// Reads the version from the `LOADER_VERSION=<digits>` line of a loader, without running it.
 ///
