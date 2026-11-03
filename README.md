@@ -94,11 +94,8 @@ commands, so push access here is high-trust: a change steers the agents of every
 - "Root instructions" applies to every repository.
 - "Index" lists the topic files, each as a path from the downstream repository root with one line
   that says when to read it:
-
-```
-- `.agent-guidance/guidance/writing.md`: read when writing PR text, commits, issues, review
-  comments, docs, code comments or replies to the user.
-```
+  - `.agent-guidance/guidance/writing.md`: read when writing PR text, commits, issues, review
+    comments, docs, code comments or replies to the user.
 
 - Keep the injected context short and put details in topic files.
   - The tests fail when the context for `GUIDANCE.md` exceeds 8,000 characters.
