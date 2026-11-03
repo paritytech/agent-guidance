@@ -2,6 +2,8 @@
 name = "agent-guidance-install"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+resolver = "3"
 description = "Installs the agent guidance loader and hook configs into a repository"
 publish = false
 # Listed explicitly: the default file list skips the templates' dot directories.

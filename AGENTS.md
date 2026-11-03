@@ -51,7 +51,11 @@ start of every session in every adopting repository:
 When changing the loader:
 
 - Bump `LOADER_VERSION` in `load.sh` and the `loader-version` file together. A test enforces this.
-- Downstream repositories pick up a new loader only when the installer is run there again.
+- Bump them for a change to a hook config template in `tools/templates/` too. The bump makes
+  downstream sessions show the out-of-date notice, so maintainers run the installer again and get
+  the new hook entry.
+- Downstream repositories pick up a new loader only when the installer is updated and run there
+  again.
 - See [How it works](docs/loader.md#how-it-works) and
   [Loader versions](docs/loader.md#loader-versions).
 

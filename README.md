@@ -38,6 +38,7 @@ agent-guidance-install
 - It adds cache entries to `.gitignore`.
 - It adds the fallback line below to `AGENTS.md` and `CLAUDE.md`.
 - It never commits. It prints the `git add` command to run.
+- To upgrade the loader, see [Upgrading the loader](docs/installer.md#upgrading-the-loader).
 
 The fallback line covers sessions where no hook delivers the guidance:
 
@@ -82,8 +83,8 @@ Every harness runs project hooks only after the workspace or folder is trusted o
 commands, so push access here is high-trust: a change steers the agents of everyone who loads it.
 
 - The loader fetches only text from this repository and never executes a fetched file.
-- Changes to the loader itself reach a repository only when a maintainer re-runs the installer
-  there and commits the result.
+- Changes to the loader itself reach a repository only when a maintainer updates the installer,
+  runs it there and commits the result.
 - `main` requires a PR with one approving review and passing CI, also for admins.
 
 ## Writing guidance
@@ -119,8 +120,6 @@ The installer, its templates and the tests live in the `tools/` crate. The templ
   like any downstream repository.
 - The test `repository_root_matches_the_templates` fails when `load.sh` or a hook config at the
   repository root differs from its template in `tools/templates/`.
-- After changing `load.sh` or the Copilot config, run the installer on this repository again:
+- After changing `load.sh` or a hook config template, run the installer on this repository again:
   `cargo run --quiet --manifest-path tools/Cargo.toml -- .`
-- The installer does not rewrite a hook config that already runs the loader.
-  - After changing one of the other hook config templates, copy it over the root file of the same
-    path.
+  - It replaces the loader entry in each root hook config with the template's entry.

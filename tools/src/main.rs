@@ -23,6 +23,10 @@ const LOADER_PATH: &str = ".agent-guidance-loader/load.sh";
 
 const LOADER: &str = include_str!("../templates/.agent-guidance-loader/load.sh");
 
+/// Command that updates this installer, and with it the loader it embeds.
+const UPDATE_INSTALLER: &str = "cargo install --force --git \
+	https://github.com/paritytech/agent-guidance agent-guidance-install";
+
 /// Hook configs merged into existing files: path, template contents, and event name.
 const HOOK_CONFIGS: [(&str, &str, &str); 4] = [
 	(
@@ -70,14 +74,83 @@ const USAGE: &str = "usage: agent-guidance-install [ROOT]
 
 Installs the agent guidance loader and hook configs into the repository at ROOT
 (default: the top level of the git repository that contains the current
-directory). Run it again to upgrade the loader.";
+directory). To upgrade the loader, update the installer, then run it again:
 
-/// Adds the loader entry of `template` to the `event` hooks of an existing config.
+  cargo install --force --git https://github.com/paritytech/agent-guidance agent-guidance-install";
+
+/// Reads the version from the `LOADER_VERSION=<digits>` line of a loader, without running it.
 ///
-/// Returns the new file contents, or `None` when an entry for `event` already runs the loader.
-/// All other keys keep their values and order. Top-level keys of the template that the config
-/// lacks, such as Cursor's `version`, are added. An error means that the config is not JSON or
-/// does not have the expected shape, and the caller must leave the file untouched.
+/// Only the first line that starts with `LOADER_VERSION=` counts. Returns its digits without
+/// leading zeros, or `None` when there is no such line or its value is not a decimal integer.
+/// The version stays text, so one too large for an integer type still compares as newer with
+/// [`is_newer`].
+fn loader_version(text: &str) -> Option<&str> {
+	let value = text
+		.lines()
+		.find_map(|line| line.strip_prefix("LOADER_VERSION="))?;
+	if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+		return None;
+	}
+	let digits = value.trim_start_matches('0');
+	Some(if digits.is_empty() { "0" } else { digits })
+}
+
+/// Whether loader version `a` is greater than `b`, both as returned by [`loader_version`].
+fn is_newer(a: &str, b: &str) -> bool {
+	(a.len(), a) > (b.len(), b)
+}
+
+/// Shell text in the Codex template's command that finds the repository root.
+const REPOSITORY_ROOT: &str = "$(git rev-parse --show-toplevel)";
+
+/// Whether the shell command `command` runs the loader and nothing else.
+///
+/// It must contain the loader path and no shell syntax that runs a second command: `;`, `&`,
+/// `|`, a line break, a backtick, `$(`, `<(` or `>(`. The Codex template's [`REPOSITORY_ROOT`]
+/// is allowed.
+fn plain_loader_command(command: &str) -> bool {
+	let rest = command.replace(REPOSITORY_ROOT, "");
+	command.contains(LOADER_PATH)
+		&& !rest.contains([';', '&', '|', '\n', '\r', '`'])
+		&& !["$(", "<(", ">("]
+			.iter()
+			.any(|syntax| rest.contains(syntax))
+}
+
+/// Whether the hook entry `entry` runs the loader and nothing else, so replacing it loses no
+/// other hook.
+///
+/// A Claude Code, Codex or Gemini CLI entry is a group with a `hooks` array. Every hook in it
+/// must be a command hook (`type` missing or `"command"`) whose `command` passes
+/// [`plain_loader_command`]. A Cursor entry has no group and must be such a hook itself. Other
+/// keys of the entry, such as a `matcher` or a `timeout`, do not matter.
+fn loader_only(entry: &Value) -> bool {
+	let loader_hook = |hook: &Value| {
+		hook.get("type").is_none_or(|kind| kind == "command")
+			&& hook
+				.get("command")
+				.and_then(Value::as_str)
+				.is_some_and(plain_loader_command)
+	};
+	match entry.get("hooks") {
+		Some(Value::Array(hooks)) => !hooks.is_empty() && hooks.iter().all(loader_hook),
+		Some(_) => false,
+		None => loader_hook(entry),
+	}
+}
+
+/// Adds or updates the loader entry of `template` in the `event` hooks of an existing config.
+///
+/// Returns the new file contents, or `None` when the only entry for `event` that runs the loader
+/// equals the template's entry. Without such an entry the template's entry is appended.
+/// Otherwise the first entry that runs the loader is replaced in place with the template's
+/// entry, and further ones are removed; edits made to them are lost. All other entries and keys
+/// keep their values and order. Top-level keys of the template that the config lacks, such as
+/// Cursor's `version`, are added.
+///
+/// An error means that the config is not JSON, does not have the expected shape, or has an
+/// entry that runs more than the loader (see [`loader_only`]), which replacing it would delete.
+/// The caller must leave the file untouched.
 fn merge_hook(existing: &str, template: &str, event: &str) -> Result<Option<String>, String> {
 	fn runs_loader(value: &Value) -> bool {
 		match value {
@@ -118,10 +191,21 @@ fn merge_hook(existing: &str, template: &str, event: &str) -> Result<Option<Stri
 	else {
 		return Err(format!("`hooks.{event}` is not a JSON array"));
 	};
-	if entries.iter().any(runs_loader) {
+	let loaders: Vec<&Value> = entries.iter().filter(|e| runs_loader(e)).collect();
+	if let [only] = loaders.as_slice()
+		&& *only == entry
+	{
 		return Ok(None);
 	}
-	entries.push(entry.clone());
+	if loaders.iter().any(|e| !loader_only(e)) {
+		return Err(format!(
+			"an entry in `hooks.{event}` runs more than the loader"
+		));
+	}
+	// Entries before the first loader entry do not run the loader, so it keeps its index.
+	let first = entries.iter().position(runs_loader);
+	entries.retain(|e| !runs_loader(e));
+	entries.insert(first.unwrap_or(entries.len()), entry.clone());
 	let mut text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
 	text.push('\n');
 	Ok(Some(text))
@@ -242,6 +326,33 @@ fn main() -> ExitCode {
 		return ExitCode::from(2);
 	}
 
+	let embedded = loader_version(LOADER).expect("the embedded loader sets LOADER_VERSION");
+	let loader = root.join(LOADER_PATH);
+	let existing = match fs::read(&loader) {
+		Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+		Err(e) => {
+			eprintln!("error: reading {LOADER_PATH}: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	let existing = existing.as_deref().and_then(loader_version);
+	// An installer built before a version bump would downgrade the loader, and its hook configs
+	// can be as old as its loader, so it writes nothing.
+	if let Some(version) = existing.filter(|version| is_newer(version, embedded)) {
+		eprintln!(
+			"error: {LOADER_PATH} is loader v{version}, newer than v{embedded} from this \
+			 installer.\nNo file was changed. Update the installer and run it again:\n  \
+			 {UPDATE_INSTALLER}"
+		);
+		return ExitCode::FAILURE;
+	}
+	let loader_report = match existing {
+		Some(version) if version == embedded => format!("loader v{embedded} (current)"),
+		Some(version) => format!("loader v{version} -> v{embedded}"),
+		None => format!("loader ? -> v{embedded}"),
+	};
+
 	let mut installer = Installer {
 		root,
 		changed: Vec::new(),
@@ -249,7 +360,6 @@ fn main() -> ExitCode {
 	let mut failed = false;
 	let result = (|| -> Result<(), String> {
 		installer.write(LOADER_PATH, LOADER)?;
-		let loader = installer.root.join(LOADER_PATH);
 		let mut permissions = fs::metadata(&loader)
 			.map_err(|e| format!("reading {LOADER_PATH}: {e}"))?
 			.permissions();
@@ -275,7 +385,8 @@ fn main() -> ExitCode {
 				Err(e) => {
 					eprintln!(
 						"error: {path}: {e}\n\
-						 The file was left unchanged. Add this hook to it by hand:\n{template}"
+						 The file was left unchanged. Add or update its loader hook by hand to \
+						 match:\n{template}"
 					);
 					failed = true;
 				}
@@ -337,6 +448,7 @@ fn main() -> ExitCode {
 		eprintln!("warning: git ignores {path}; add it with `git add -f {path}`");
 	}
 
+	println!("{loader_report}");
 	if installer.changed.is_empty() {
 		println!("Nothing to change.");
 	} else {
@@ -364,170 +476,4 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn parse(text: &str) -> Value {
-		serde_json::from_str(text).expect("merge output is JSON")
-	}
-
-	#[test]
-	fn templates_install_into_an_empty_config() {
-		for (path, template, event) in HOOK_CONFIGS {
-			let merged = merge_hook("{}", template, event)
-				.unwrap_or_else(|e| panic!("{path}: {e}"))
-				.unwrap_or_else(|| panic!("{path}: nothing merged"));
-			assert_eq!(parse(&merged), parse(template), "{path}");
-		}
-	}
-
-	#[test]
-	fn templates_already_contain_the_loader() {
-		for (path, template, event) in HOOK_CONFIGS {
-			assert_eq!(merge_hook(template, template, event), Ok(None), "{path}");
-		}
-	}
-
-	/// This repository installs its own hook and owns its root copies of the installed files.
-	///
-	/// Checks that, at the repository root, `.agent-guidance-loader/load.sh` and all five hook
-	/// configs are byte-identical to their templates, that `load.sh` has all three executable
-	/// bits (git records only the executable bit, so the rest of the mode depends on the umask),
-	/// and that `.gitignore` holds both ignore lines. A template change that is not copied to
-	/// the root fails here.
-	#[test]
-	fn repository_root_matches_the_templates() {
-		let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-		let read = |path: &str| {
-			fs::read_to_string(root.join(path))
-				.unwrap_or_else(|e| panic!("{path}: {e}; run the installer on this repository"))
-		};
-		let templates = [(LOADER_PATH, LOADER), COPILOT_CONFIG]
-			.into_iter()
-			.chain(HOOK_CONFIGS.map(|(path, template, _)| (path, template)));
-		for (path, template) in templates {
-			assert!(
-				read(path) == template,
-				"{path} differs from tools/templates/{path}; copy the template over it"
-			);
-		}
-		let mode = fs::metadata(root.join(LOADER_PATH))
-			.map(|metadata| metadata.permissions().mode())
-			.unwrap_or_else(|e| panic!("{LOADER_PATH}: {e}"));
-		assert_eq!(
-			mode & 0o111,
-			0o111,
-			"{LOADER_PATH} must be executable; run the installer on this repository"
-		);
-		let gitignore = read(".gitignore");
-		for line in GITIGNORE_LINES {
-			assert!(ignores(&gitignore, line), ".gitignore lacks {line}");
-		}
-	}
-
-	#[test]
-	fn fallback_is_wrapped_at_80_columns() {
-		assert!(FALLBACK.lines().count() > 1);
-		for line in FALLBACK.lines() {
-			assert!(line.chars().count() <= 80, "{line:?}");
-		}
-		// Detection of an existing fallback relies on this substring.
-		assert!(FALLBACK.contains("agent-guidance"));
-	}
-
-	/// Without a matcher the hooks run for every session source, `fork` included.
-	#[test]
-	fn templates_have_no_matcher() {
-		for (path, template, event) in HOOK_CONFIGS {
-			let entry = &parse(template)["hooks"][event][0];
-			assert!(entry.get("matcher").is_none(), "{path}");
-		}
-	}
-
-	#[test]
-	fn copilot_template_runs_the_loader() {
-		let config = parse(COPILOT_CONFIG.1);
-		assert_eq!(config["version"], 1);
-		let command = config["hooks"]["sessionStart"][0]["bash"]
-			.as_str()
-			.expect("bash command");
-		assert!(command.contains(LOADER_PATH));
-	}
-
-	#[test]
-	fn appends_after_existing_entries_and_keeps_other_keys() {
-		let (_, template, event) = HOOK_CONFIGS[0];
-		let existing = r#"{
-			"permissions": {"allow": ["Bash(ls)"]},
-			"hooks": {
-				"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "a"}]}],
-				"SessionStart": [{"hooks": [{"type": "command", "command": "b"}]}]
-			},
-			"model": "x"
-		}"#;
-		let merged = parse(&merge_hook(existing, template, event).unwrap().unwrap());
-		let keys: Vec<&String> = merged.as_object().unwrap().keys().collect();
-		assert_eq!(keys, ["permissions", "hooks", "model"]);
-		let hook_keys: Vec<&String> = merged["hooks"].as_object().unwrap().keys().collect();
-		assert_eq!(hook_keys, ["PreToolUse", "SessionStart"]);
-		assert_eq!(
-			merged["hooks"]["PreToolUse"],
-			parse(existing)["hooks"]["PreToolUse"]
-		);
-		let entries = merged["hooks"]["SessionStart"].as_array().unwrap();
-		assert_eq!(entries.len(), 2);
-		assert_eq!(entries[0]["hooks"][0]["command"], "b");
-		assert_eq!(entries[1], parse(template)["hooks"]["SessionStart"][0]);
-		assert_eq!(merged["permissions"], parse(existing)["permissions"]);
-	}
-
-	#[test]
-	fn merging_twice_changes_nothing() {
-		for (path, template, event) in HOOK_CONFIGS {
-			let existing = r#"{"hooks": {"Other": []}}"#;
-			let once = merge_hook(existing, template, event).unwrap().unwrap();
-			assert_eq!(merge_hook(&once, template, event), Ok(None), "{path}");
-		}
-	}
-
-	#[test]
-	fn adds_missing_cursor_version_and_keeps_an_existing_one() {
-		let (_, template, event) = HOOK_CONFIGS[3];
-		let added = parse(
-			&merge_hook(r#"{"hooks": {}}"#, template, event)
-				.unwrap()
-				.unwrap(),
-		);
-		assert_eq!(added["version"], 1);
-		let kept = r#"{"version": 2, "hooks": {"stop": [{"command": "x"}]}}"#;
-		let kept = parse(&merge_hook(kept, template, event).unwrap().unwrap());
-		assert_eq!(kept["version"], 2);
-		assert_eq!(kept["hooks"]["stop"][0]["command"], "x");
-	}
-
-	#[test]
-	fn rejects_configs_it_cannot_merge() {
-		let (_, template, event) = HOOK_CONFIGS[0];
-		for existing in [
-			"",
-			"{",
-			"{} trailing",
-			"[]",
-			r#"{"hooks": []}"#,
-			r#"{"hooks": {"SessionStart": {}}}"#,
-		] {
-			assert!(
-				merge_hook(existing, template, event).is_err(),
-				"{existing:?}"
-			);
-		}
-	}
-
-	#[test]
-	fn recognizes_the_loader_anywhere_in_an_entry() {
-		let (_, template, event) = HOOK_CONFIGS[0];
-		let existing = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command",
-			"command": "bash ./.agent-guidance-loader/load.sh claude --extra"}]}]}}"#;
-		assert_eq!(merge_hook(existing, template, event), Ok(None));
-	}
-}
+mod tests;

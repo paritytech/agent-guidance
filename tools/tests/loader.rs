@@ -35,7 +35,9 @@ const OFFLINE: &str = "file:///nonexistent/agent-guidance.git";
 const HARNESSES: [&str; 5] = ["claude", "codex", "gemini", "cursor", "copilot"];
 const FALLBACK: &str = "Company agent guidance could not be fetched for this session. Follow the \
 	agent-guidance instruction in AGENTS.md or CLAUDE.md to read it.";
-const OUT_OF_DATE: &str = "; loader out of date, re-run agent-guidance-install";
+/// The steps the out-of-date notice tells the user to take.
+const UPGRADE: &str = "run cargo install --force --git https://github.com/paritytech/agent-guidance \
+	agent-guidance-install, then agent-guidance-install, and commit";
 
 /// Upper bound for a loader run against a network that accepts connections and never answers.
 const HUNG_BUDGET: Duration = Duration::from_secs(6);
@@ -1235,22 +1237,46 @@ fn stale_loader_notice(bash: &Path) {
 		(format!("{loader}\n"), None),
 	] {
 		fixture.publish(&[("loader-version", version.as_bytes())]);
-		let run = fixture.run_updated(bash, None);
+		let suffix = match notice {
+			Some(latest) => {
+				format!("; loader v{loader} out of date (v{latest} available): {UPGRADE}")
+			}
+			None => String::new(),
+		};
+		// Harnesses with a status line get the notice there and not in the context.
+		for harness in [None, Some("claude"), Some("codex"), Some("gemini")] {
+			let run = fixture.run_updated(bash, harness);
+			assert_eq!(
+				run.context(harness),
+				current,
+				"{harness:?}, loader-version {version:?}"
+			);
+			let status = format!(
+				"parity-agent-guidance: loaded {} (fetched){suffix}",
+				fixture.short_head(),
+			);
+			assert_eq!(
+				run.system_message(),
+				status,
+				"{harness:?}, loader-version {version:?}"
+			);
+		}
+		// Cursor and Copilot have no status line, so the context carries the notice.
 		let expected = match notice {
 			Some(latest) => format!(
 				"{current}\n\nThe agent-guidance loader committed in this repository is version \
-				 {loader}; the current version is {latest}. Tell the user to update it by running \
-				 agent-guidance-install."
+				 {loader}; the current version is {latest}. Tell the user to update it: {UPGRADE}."
 			),
 			None => current.clone(),
 		};
-		assert_eq!(run.context(None), expected, "loader-version {version:?}");
-		let status = format!(
-			"parity-agent-guidance: loaded {} (fetched){}",
-			fixture.short_head(),
-			if notice.is_some() { OUT_OF_DATE } else { "" }
-		);
-		assert_eq!(run.system_message(), status, "loader-version {version:?}");
+		for harness in ["cursor", "copilot"] {
+			let run = fixture.run(bash, &fixture.url(), Some(harness));
+			assert_eq!(
+				run.context(Some(harness)),
+				expected,
+				"{harness}, loader-version {version:?}"
+			);
+		}
 	}
 }
 

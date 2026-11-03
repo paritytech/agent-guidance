@@ -1,0 +1,413 @@
+use super::*;
+
+fn parse(text: &str) -> Value {
+	serde_json::from_str(text).expect("merge output is JSON")
+}
+
+#[test]
+fn templates_install_into_an_empty_config() {
+	for (path, template, event) in HOOK_CONFIGS {
+		let merged = merge_hook("{}", template, event)
+			.unwrap_or_else(|e| panic!("{path}: {e}"))
+			.unwrap_or_else(|| panic!("{path}: nothing merged"));
+		assert_eq!(parse(&merged), parse(template), "{path}");
+	}
+}
+
+#[test]
+fn templates_already_contain_the_loader() {
+	for (path, template, event) in HOOK_CONFIGS {
+		assert_eq!(merge_hook(template, template, event), Ok(None), "{path}");
+	}
+}
+
+/// This repository installs its own hook and owns its root copies of the installed files.
+///
+/// Checks that, at the repository root, `.agent-guidance-loader/load.sh` and all five hook
+/// configs are byte-identical to their templates, that `load.sh` has all three executable
+/// bits (git records only the executable bit, so the rest of the mode depends on the umask),
+/// and that `.gitignore` holds both ignore lines. A template change that is not copied to
+/// the root fails here.
+#[test]
+fn repository_root_matches_the_templates() {
+	let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+	let read = |path: &str| {
+		fs::read_to_string(root.join(path))
+			.unwrap_or_else(|e| panic!("{path}: {e}; run the installer on this repository"))
+	};
+	let templates = [(LOADER_PATH, LOADER), COPILOT_CONFIG]
+		.into_iter()
+		.chain(HOOK_CONFIGS.map(|(path, template, _)| (path, template)));
+	for (path, template) in templates {
+		assert!(
+			read(path) == template,
+			"{path} differs from tools/templates/{path}; copy the template over it"
+		);
+	}
+	let mode = fs::metadata(root.join(LOADER_PATH))
+		.map(|metadata| metadata.permissions().mode())
+		.unwrap_or_else(|e| panic!("{LOADER_PATH}: {e}"));
+	assert_eq!(
+		mode & 0o111,
+		0o111,
+		"{LOADER_PATH} must be executable; run the installer on this repository"
+	);
+	let gitignore = read(".gitignore");
+	for line in GITIGNORE_LINES {
+		assert!(ignores(&gitignore, line), ".gitignore lacks {line}");
+	}
+}
+
+#[test]
+fn reads_the_loader_version_as_text() {
+	assert_eq!(
+		loader_version("#!/usr/bin/env bash\n# x\nLOADER_VERSION=7\nLOADER_VERSION=8\n"),
+		Some("7")
+	);
+	for (text, version) in [
+		("LOADER_VERSION=7\r\n", "7"),
+		("LOADER_VERSION=007\n", "7"),
+		("LOADER_VERSION=0\n", "0"),
+		("LOADER_VERSION=000\n", "0"),
+		(
+			"LOADER_VERSION=99999999999999999999999\n",
+			"99999999999999999999999",
+		),
+	] {
+		assert_eq!(loader_version(text), Some(version), "{text:?}");
+	}
+	for text in [
+		"",
+		"#!/bin/sh\nold loader\n",
+		"LOADER_VERSION=\n",
+		"LOADER_VERSION=abc\n",
+		"LOADER_VERSION=+7\n",
+		"LOADER_VERSION=-7\n",
+		"LOADER_VERSION=7 # comment\n",
+		" LOADER_VERSION=7\n",
+		"# LOADER_VERSION=7\n",
+		"LOADER_VERSION=x\nLOADER_VERSION=7\n",
+	] {
+		assert_eq!(loader_version(text), None, "{text:?}");
+	}
+}
+
+#[test]
+fn compares_loader_versions_of_any_length() {
+	assert!(is_newer("5", "4"));
+	assert!(is_newer("10", "9"));
+	assert!(is_newer("99999999999999999999999", "4"));
+	assert!(!is_newer("4", "4"));
+	assert!(!is_newer("9", "10"));
+	assert!(!is_newer("0", "4"));
+}
+
+#[test]
+fn embedded_loader_has_a_version() {
+	assert!(loader_version(LOADER).is_some());
+}
+
+#[test]
+fn usage_names_the_installer_update() {
+	assert!(USAGE.contains(UPDATE_INSTALLER), "{USAGE}");
+}
+
+#[test]
+fn fallback_is_wrapped_at_80_columns() {
+	assert!(FALLBACK.lines().count() > 1);
+	for line in FALLBACK.lines() {
+		assert!(line.chars().count() <= 80, "{line:?}");
+	}
+	// Detection of an existing fallback relies on this substring.
+	assert!(FALLBACK.contains("agent-guidance"));
+}
+
+/// Without a matcher the hooks run for every session source, `fork` included.
+#[test]
+fn templates_have_no_matcher() {
+	for (path, template, event) in HOOK_CONFIGS {
+		let entry = &parse(template)["hooks"][event][0];
+		assert!(entry.get("matcher").is_none(), "{path}");
+	}
+}
+
+#[test]
+fn copilot_template_runs_the_loader() {
+	let config = parse(COPILOT_CONFIG.1);
+	assert_eq!(config["version"], 1);
+	let command = config["hooks"]["sessionStart"][0]["bash"]
+		.as_str()
+		.expect("bash command");
+	assert!(command.contains(LOADER_PATH));
+}
+
+#[test]
+fn appends_after_existing_entries_and_keeps_other_keys() {
+	let (_, template, event) = HOOK_CONFIGS[0];
+	let existing = r#"{
+		"permissions": {"allow": ["Bash(ls)"]},
+		"hooks": {
+			"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "a"}]}],
+			"SessionStart": [{"hooks": [{"type": "command", "command": "b"}]}]
+		},
+		"model": "x"
+	}"#;
+	let merged = parse(&merge_hook(existing, template, event).unwrap().unwrap());
+	let keys: Vec<&String> = merged.as_object().unwrap().keys().collect();
+	assert_eq!(keys, ["permissions", "hooks", "model"]);
+	let hook_keys: Vec<&String> = merged["hooks"].as_object().unwrap().keys().collect();
+	assert_eq!(hook_keys, ["PreToolUse", "SessionStart"]);
+	assert_eq!(
+		merged["hooks"]["PreToolUse"],
+		parse(existing)["hooks"]["PreToolUse"]
+	);
+	let entries = merged["hooks"]["SessionStart"].as_array().unwrap();
+	assert_eq!(entries.len(), 2);
+	assert_eq!(entries[0]["hooks"][0]["command"], "b");
+	assert_eq!(entries[1], parse(template)["hooks"]["SessionStart"][0]);
+	assert_eq!(merged["permissions"], parse(existing)["permissions"]);
+}
+
+#[test]
+fn merging_twice_changes_nothing() {
+	for (path, template, event) in HOOK_CONFIGS {
+		let existing = r#"{"hooks": {"Other": []}}"#;
+		let once = merge_hook(existing, template, event).unwrap().unwrap();
+		assert_eq!(merge_hook(&once, template, event), Ok(None), "{path}");
+	}
+}
+
+#[test]
+fn adds_missing_cursor_version_and_keeps_an_existing_one() {
+	let (_, template, event) = HOOK_CONFIGS[3];
+	let added = parse(
+		&merge_hook(r#"{"hooks": {}}"#, template, event)
+			.unwrap()
+			.unwrap(),
+	);
+	assert_eq!(added["version"], 1);
+	let kept = r#"{"version": 2, "hooks": {"stop": [{"command": "x"}]}}"#;
+	let kept = parse(&merge_hook(kept, template, event).unwrap().unwrap());
+	assert_eq!(kept["version"], 2);
+	assert_eq!(kept["hooks"]["stop"][0]["command"], "x");
+}
+
+#[test]
+fn rejects_configs_it_cannot_merge() {
+	let (_, template, event) = HOOK_CONFIGS[0];
+	for existing in [
+		"",
+		"{",
+		"{} trailing",
+		"[]",
+		r#"{"hooks": []}"#,
+		r#"{"hooks": {"SessionStart": {}}}"#,
+	] {
+		assert!(
+			merge_hook(existing, template, event).is_err(),
+			"{existing:?}"
+		);
+	}
+}
+
+/// `value` with every value under `key`, at any depth, replaced by `new`.
+fn rewrite(value: &Value, key: &str, new: &Value) -> Value {
+	match value {
+		Value::Array(items) => Value::Array(items.iter().map(|v| rewrite(v, key, new)).collect()),
+		Value::Object(map) => Value::Object(
+			map.iter()
+				.map(|(k, v)| {
+					let v = if k == key {
+						new.clone()
+					} else {
+						rewrite(v, key, new)
+					};
+					(k.clone(), v)
+				})
+				.collect(),
+		),
+		other => other.clone(),
+	}
+}
+
+/// The loader entry of `template` for `event`.
+fn template_entry(template: &str, event: &str) -> Value {
+	parse(template)["hooks"][event][0].clone()
+}
+
+/// An entry of the same shape as `entry` that runs `command` instead of the loader.
+fn other_entry(entry: &Value, command: &str) -> Value {
+	rewrite(entry, "command", &Value::from(command))
+}
+
+/// `entry` with a hook the user added next to the loader.
+fn mixed_entry(entry: &Value) -> Value {
+	let mut entry = entry.clone();
+	match entry.get_mut("hooks").and_then(Value::as_array_mut) {
+		Some(hooks) => hooks.push(serde_json::json!({"type": "command", "command": "echo hello"})),
+		// A Cursor entry has one command, so here the loader path is in another key.
+		None => {
+			entry["note"] = entry["command"].clone();
+			entry["command"] = Value::from("echo hello");
+		}
+	}
+	entry
+}
+
+/// A config with `entries` for `event`, between two other keys.
+fn config_with(event: &str, entries: &[Value]) -> String {
+	serde_json::json!({"first": 1, "hooks": {"Other": [], event: entries}, "last": 2}).to_string()
+}
+
+#[test]
+fn replaces_an_outdated_loader_entry_in_place() {
+	for (path, template, event) in HOOK_CONFIGS {
+		let entry = template_entry(template, event);
+		let before = other_entry(&entry, "before");
+		let after = other_entry(&entry, "after");
+		for outdated in [
+			rewrite(&entry, "timeout", &Value::from(1)),
+			other_entry(&entry, "bash ./.agent-guidance-loader/load.sh --old"),
+		] {
+			let existing = config_with(event, &[before.clone(), outdated, after.clone()]);
+			let merged = parse(
+				&merge_hook(&existing, template, event)
+					.unwrap_or_else(|e| panic!("{path}: {e}"))
+					.unwrap_or_else(|| panic!("{path}: nothing changed")),
+			);
+			// Template keys the config lacks, such as Cursor's `version`, follow the existing ones.
+			let keys: Vec<&String> = merged.as_object().unwrap().keys().collect();
+			assert_eq!(keys[..3], ["first", "hooks", "last"], "{path}");
+			let hook_keys: Vec<&String> = merged["hooks"].as_object().unwrap().keys().collect();
+			assert_eq!(hook_keys, ["Other", event], "{path}");
+			assert_eq!(
+				merged["hooks"][event],
+				Value::Array(vec![before.clone(), entry.clone(), after.clone()]),
+				"{path}"
+			);
+			assert_eq!(
+				merge_hook(&merged.to_string(), template, event),
+				Ok(None),
+				"{path}"
+			);
+		}
+	}
+}
+
+#[test]
+fn collapses_duplicate_loader_entries() {
+	for (path, template, event) in HOOK_CONFIGS {
+		let entry = template_entry(template, event);
+		let outdated = rewrite(&entry, "timeout", &Value::from(1));
+		let other = other_entry(&entry, "other");
+		for entries in [
+			[outdated.clone(), other.clone(), entry.clone()],
+			[other.clone(), entry.clone(), entry.clone()],
+		] {
+			let position = entries.iter().position(|e| *e != other).unwrap();
+			let existing = config_with(event, &entries);
+			let merged = parse(
+				&merge_hook(&existing, template, event)
+					.unwrap_or_else(|e| panic!("{path}: {e}"))
+					.unwrap_or_else(|| panic!("{path}: nothing changed")),
+			);
+			let mut expected = vec![other.clone()];
+			expected.insert(position, entry.clone());
+			assert_eq!(merged["hooks"][event], Value::Array(expected), "{path}");
+		}
+	}
+}
+
+/// Replacing an entry that runs the loader next to other hooks would delete those hooks.
+#[test]
+fn rejects_a_loader_entry_with_other_hooks() {
+	for (path, template, event) in HOOK_CONFIGS {
+		let entry = template_entry(template, event);
+		let existing = config_with(event, &[mixed_entry(&entry)]);
+		let error = merge_hook(&existing, template, event).expect_err(path);
+		assert_eq!(
+			error,
+			format!("an entry in `hooks.{event}` runs more than the loader"),
+			"{path}"
+		);
+		// A second, loader-only entry does not make the mixed one safe to remove.
+		let existing = config_with(event, &[entry.clone(), mixed_entry(&entry)]);
+		assert!(merge_hook(&existing, template, event).is_err(), "{path}");
+	}
+}
+
+/// The command of a template's loader entry.
+fn template_command(entry: &Value) -> String {
+	entry
+		.pointer("/hooks/0/command")
+		.or_else(|| entry.get("command"))
+		.and_then(Value::as_str)
+		.expect("a loader command")
+		.to_owned()
+}
+
+/// Hooks without a `command`, such as an HTTP hook, also count as other hooks.
+#[test]
+fn rejects_a_loader_group_with_hooks_of_other_types() {
+	for (path, template, event) in HOOK_CONFIGS {
+		let entry = template_entry(template, event);
+		if entry.get("hooks").is_none() {
+			continue;
+		}
+		for extra in [
+			serde_json::json!({"type": "http", "url": "https://example.com/hook"}),
+			serde_json::json!({"type": "prompt", "command": ".agent-guidance-loader/load.sh"}),
+			serde_json::json!({}),
+		] {
+			let mut mixed = entry.clone();
+			mixed["hooks"].as_array_mut().unwrap().push(extra.clone());
+			let existing = config_with(event, &[mixed]);
+			assert!(
+				merge_hook(&existing, template, event).is_err(),
+				"{path}: {extra}"
+			);
+		}
+		let mut empty = entry.clone();
+		empty["hooks"] = Value::Array(Vec::new());
+		empty["note"] = Value::from(LOADER_PATH);
+		let existing = config_with(event, &[empty]);
+		assert!(merge_hook(&existing, template, event).is_err(), "{path}");
+	}
+}
+
+/// A command that runs the loader and chains another command runs more than the loader.
+#[test]
+fn rejects_a_loader_command_that_runs_other_commands() {
+	for (path, template, event) in HOOK_CONFIGS {
+		let entry = template_entry(template, event);
+		let command = template_command(&entry);
+		for chained in [
+			format!("{command} && notify-me"),
+			format!("{command}; notify-me"),
+			format!("{command} || notify-me"),
+			format!("{command} | tee log"),
+			format!("{command} &"),
+			format!("{command}\nnotify-me"),
+			format!("{command} `notify-me`"),
+			format!("{command} $(notify-me)"),
+			format!("{command} <(notify-me)"),
+			format!("{command} >(notify-me)"),
+			"bash -c 'x; ./.agent-guidance-loader/load.sh'".to_owned(),
+		] {
+			let changed = rewrite(&entry, "command", &Value::from(chained.clone()));
+			let existing = config_with(event, &[changed]);
+			assert!(
+				merge_hook(&existing, template, event).is_err(),
+				"{path}: {chained:?}"
+			);
+		}
+	}
+}
+
+/// Every template entry counts as loader-only, so an outdated copy of it can be replaced.
+#[test]
+fn template_entries_run_only_the_loader() {
+	for (path, template, event) in HOOK_CONFIGS {
+		assert!(loader_only(&template_entry(template, event)), "{path}");
+	}
+}
