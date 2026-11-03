@@ -100,12 +100,57 @@ fn is_newer(a: &str, b: &str) -> bool {
 	(a.len(), a) > (b.len(), b)
 }
 
-/// Adds the loader entry of `template` to the `event` hooks of an existing config.
+/// Shell text in the Codex template's command that finds the repository root.
+const REPOSITORY_ROOT: &str = "$(git rev-parse --show-toplevel)";
+
+/// Whether the shell command `command` runs the loader and nothing else.
 ///
-/// Returns the new file contents, or `None` when an entry for `event` already runs the loader.
-/// All other keys keep their values and order. Top-level keys of the template that the config
-/// lacks, such as Cursor's `version`, are added. An error means that the config is not JSON or
-/// does not have the expected shape, and the caller must leave the file untouched.
+/// It must contain the loader path and no shell syntax that runs a second command: `;`, `&`,
+/// `|`, a line break, a backtick, `$(`, `<(` or `>(`. The Codex template's [`REPOSITORY_ROOT`]
+/// is allowed.
+fn plain_loader_command(command: &str) -> bool {
+	let rest = command.replace(REPOSITORY_ROOT, "");
+	command.contains(LOADER_PATH)
+		&& !rest.contains([';', '&', '|', '\n', '\r', '`'])
+		&& !["$(", "<(", ">("]
+			.iter()
+			.any(|syntax| rest.contains(syntax))
+}
+
+/// Whether the hook entry `entry` runs the loader and nothing else, so replacing it loses no
+/// other hook.
+///
+/// A Claude Code, Codex or Gemini CLI entry is a group with a `hooks` array. Every hook in it
+/// must be a command hook (`type` missing or `"command"`) whose `command` passes
+/// [`plain_loader_command`]. A Cursor entry has no group and must be such a hook itself. Other
+/// keys of the entry, such as a `matcher` or a `timeout`, do not matter.
+fn loader_only(entry: &Value) -> bool {
+	let loader_hook = |hook: &Value| {
+		hook.get("type").is_none_or(|kind| kind == "command")
+			&& hook
+				.get("command")
+				.and_then(Value::as_str)
+				.is_some_and(plain_loader_command)
+	};
+	match entry.get("hooks") {
+		Some(Value::Array(hooks)) => !hooks.is_empty() && hooks.iter().all(loader_hook),
+		Some(_) => false,
+		None => loader_hook(entry),
+	}
+}
+
+/// Adds or updates the loader entry of `template` in the `event` hooks of an existing config.
+///
+/// Returns the new file contents, or `None` when the only entry for `event` that runs the loader
+/// equals the template's entry. Without such an entry the template's entry is appended.
+/// Otherwise the first entry that runs the loader is replaced in place with the template's
+/// entry, and further ones are removed; edits made to them are lost. All other entries and keys
+/// keep their values and order. Top-level keys of the template that the config lacks, such as
+/// Cursor's `version`, are added.
+///
+/// An error means that the config is not JSON, does not have the expected shape, or has an
+/// entry that runs more than the loader (see [`loader_only`]), which replacing it would delete.
+/// The caller must leave the file untouched.
 fn merge_hook(existing: &str, template: &str, event: &str) -> Result<Option<String>, String> {
 	fn runs_loader(value: &Value) -> bool {
 		match value {
@@ -146,10 +191,21 @@ fn merge_hook(existing: &str, template: &str, event: &str) -> Result<Option<Stri
 	else {
 		return Err(format!("`hooks.{event}` is not a JSON array"));
 	};
-	if entries.iter().any(runs_loader) {
+	let loaders: Vec<&Value> = entries.iter().filter(|e| runs_loader(e)).collect();
+	if let [only] = loaders.as_slice()
+		&& *only == entry
+	{
 		return Ok(None);
 	}
-	entries.push(entry.clone());
+	if loaders.iter().any(|e| !loader_only(e)) {
+		return Err(format!(
+			"an entry in `hooks.{event}` runs more than the loader"
+		));
+	}
+	// Entries before the first loader entry do not run the loader, so it keeps its index.
+	let first = entries.iter().position(runs_loader);
+	entries.retain(|e| !runs_loader(e));
+	entries.insert(first.unwrap_or(entries.len()), entry.clone());
 	let mut text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
 	text.push('\n');
 	Ok(Some(text))
@@ -329,7 +385,8 @@ fn main() -> ExitCode {
 				Err(e) => {
 					eprintln!(
 						"error: {path}: {e}\n\
-						 The file was left unchanged. Add this hook to it by hand:\n{template}"
+						 The file was left unchanged. Add or update its loader hook by hand to \
+						 match:\n{template}"
 					);
 					failed = true;
 				}

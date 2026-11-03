@@ -17,11 +17,26 @@ repository, and leaves committing to the maintainer.
 - It creates or updates `.claude/settings.json`, `.codex/hooks.json`, `.gemini/settings.json` and
   `.cursor/hooks.json`.
   - A missing file is created from the template.
-  - In an existing file, the hook entry is appended to the event's list unless an entry already
-    runs the loader.
+  - In an existing file without a loader entry, the template's entry is appended to the event's
+    list.
+  - An existing loader entry that differs from the template is replaced in place, and further
+    loader entries are removed.
+    - Edits made to the loader entry, such as a longer timeout, are lost, the same as edits to
+      `load.sh`.
+    - A command that passes the loader path to another program, such as
+      `notify-me .agent-guidance-loader/load.sh`, looks the same as a loader call and is
+      replaced too.
   - All other content in an existing file is kept.
-  - A file that is not valid JSON is left unchanged.
-    - The installer then prints the entry to add by hand and exits with status 1.
+  - Some files are left unchanged. The installer then prints the template to merge by hand and
+    exits with status 1.
+    - A file that is not valid JSON or does not have the expected shape.
+    - A file with an entry that runs more than the loader. Replacing that entry would delete the
+      rest.
+      - A Claude Code, Codex or Gemini CLI `hooks` group with a second hook of any type, such as
+        a second command or an HTTP hook.
+      - A loader command with shell syntax that runs another command: `;`, `&`, `|`, a line
+        break, a backtick, `$(`, `<(` or `>(`, for example `load.sh claude && notify-me`. The
+        `$(git rev-parse --show-toplevel)` of the Codex template is allowed.
 - It always writes `.github/hooks/agent-guidance.json` from the template.
 - It adds `/.agent-guidance/` and `/.agent-guidance.tmp.*/` to `.gitignore` unless equivalent lines
   exist.

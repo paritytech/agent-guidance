@@ -622,3 +622,153 @@ fn config_with(event: &str, entries: &[Value]) -> String {
 	text.push('\n');
 	text
 }
+
+/// An outdated loader entry (another timeout) is replaced where it is, and the user's own
+/// entries before and after it are kept.
+#[test]
+fn updates_an_outdated_loader_entry() {
+	let repo = Repo::new();
+	let mut expected = Vec::new();
+	for (path, event) in MERGED_CONFIGS {
+		let entry = template_entry(path, event);
+		let before = rewrite(&entry, "command", &Value::from("before"));
+		let after = rewrite(&entry, "command", &Value::from("after"));
+		let outdated = rewrite(&entry, "timeout", &Value::from(1));
+		repo.write(
+			path,
+			&config_with(event, &[before.clone(), outdated, after.clone()]),
+		);
+		expected.push(Value::Array(vec![before, entry, after]));
+	}
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	for ((path, event), entries) in MERGED_CONFIGS.into_iter().zip(expected) {
+		let config = repo.json(path);
+		assert_eq!(config["hooks"][event], entries, "{path}");
+		assert_eq!(config["model"], "x", "{path}");
+		assert!(stdout(&output).contains(&format!("  {path}\n")), "{path}");
+	}
+	repo.assert_hooks_installed();
+	repo.assert_second_run_changes_nothing();
+}
+
+#[test]
+fn collapses_duplicate_loader_entries() {
+	let repo = Repo::new();
+	for (path, event) in MERGED_CONFIGS {
+		let entry = template_entry(path, event);
+		let other = rewrite(&entry, "command", &Value::from("other"));
+		let outdated = rewrite(&entry, "timeout", &Value::from(1));
+		repo.write(
+			path,
+			&config_with(event, &[outdated, other.clone(), entry.clone()]),
+		);
+	}
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	for (path, event) in MERGED_CONFIGS {
+		let entry = template_entry(path, event);
+		let other = rewrite(&entry, "command", &Value::from("other"));
+		assert_eq!(
+			repo.json(path)["hooks"][event],
+			Value::Array(vec![entry, other]),
+			"{path}"
+		);
+	}
+	repo.assert_hooks_installed();
+	repo.assert_second_run_changes_nothing();
+}
+
+/// `entry` with its loader command followed by `suffix`.
+fn chain(entry: &Value, suffix: &str) -> Value {
+	let command = entry
+		.pointer("/hooks/0/command")
+		.or_else(|| entry.get("command"))
+		.and_then(Value::as_str)
+		.expect("a loader command");
+	rewrite(entry, "command", &Value::from(format!("{command}{suffix}")))
+}
+
+/// Installs over hook configs whose loader entry `mix` turned into one that runs more than the
+/// loader, and asserts that the installer leaves them for the user to edit.
+fn assert_mixed_entries_untouched(mix: impl Fn(Value) -> Value) {
+	let repo = Repo::new();
+	let mut written = Vec::new();
+	for (path, event) in MERGED_CONFIGS {
+		let config = config_with(event, &[mix(template_entry(path, event))]);
+		repo.write(path, &config);
+		written.push(config);
+	}
+	let output = repo.install();
+	assert_eq!(output.status.code(), Some(1));
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	for ((path, event), config) in MERGED_CONFIGS.into_iter().zip(&written) {
+		assert_eq!(repo.read(path), *config, "{path}");
+		assert!(
+			stderr.contains(&format!(
+				"error: {path}: an entry in `hooks.{event}` runs more than the loader\n"
+			)),
+			"{stderr}"
+		);
+		assert!(stderr.contains(&template(path)), "{path}: {stderr}");
+	}
+	// Everything else is still installed.
+	assert_eq!(repo.read(LOADER), template(LOADER));
+	assert_eq!(repo.read(COPILOT_CONFIG), template(COPILOT_CONFIG));
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n"));
+
+	let files = repo.snapshot();
+	let output = repo.install();
+	assert_eq!(output.status.code(), Some(1));
+	assert_eq!(
+		stdout(&output),
+		format!("{}Nothing to change.\n", current())
+	);
+	assert_eq!(repo.snapshot(), files);
+}
+
+/// An entry that runs the loader next to the user's own command is left for the user to edit.
+#[test]
+fn leaves_a_mixed_loader_entry_untouched() {
+	assert_mixed_entries_untouched(|mut entry| {
+		match entry.get_mut("hooks").and_then(Value::as_array_mut) {
+			Some(hooks) => {
+				hooks.push(serde_json::json!({"type": "command", "command": "echo hello"}))
+			}
+			// A Cursor entry has one command, so here the loader path is in another key.
+			None => {
+				entry["note"] = entry["command"].clone();
+				entry["command"] = Value::from("echo hello");
+			}
+		}
+		entry
+	});
+}
+
+/// An HTTP hook has no `command`, and replacing its group would delete it.
+#[test]
+fn leaves_a_loader_group_with_an_http_hook_untouched() {
+	assert_mixed_entries_untouched(|mut entry| {
+		match entry.get_mut("hooks").and_then(Value::as_array_mut) {
+			Some(hooks) => hooks.push(
+				serde_json::json!({"type": "http", "url": "https://example.com/session-start"}),
+			),
+			// A Cursor entry has no group, so here the command chains another one.
+			None => entry = chain(&entry, " && notify-me"),
+		}
+		entry
+	});
+}
+
+#[test]
+fn leaves_a_chained_loader_command_untouched() {
+	assert_mixed_entries_untouched(|entry| chain(&entry, " && notify-me"));
+}

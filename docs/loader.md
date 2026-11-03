@@ -112,7 +112,10 @@ field (see [What reaches the user](harnesses.md#what-reaches-the-user)).
 
 - `load.sh` sets `LOADER_VERSION`.
 - The `loader-version` file in this repository holds the current version.
-- Bump both together whenever `tools/templates/.agent-guidance-loader/load.sh` changes.
+- Bump both together whenever `tools/templates/.agent-guidance-loader/load.sh` or a hook config
+  template in `tools/templates/` changes.
+  - A hook config change reaches a repository only when the installer runs there again, and the
+    bump is what tells its maintainers to do that.
 - When the fetched `loader-version` is greater than the version of the committed loader, the
   loader tells the user how to upgrade.
   - In Claude Code, Codex and Gemini CLI the notice is at the end of the
