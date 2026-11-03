@@ -19,8 +19,9 @@
 # a set of instructions that agents act on, so whoever can push to the guidance
 # repository can steer every agent that loads it. Changes to this script reach
 # a repository only when the installer is run there again. When the fetched
-# loader-version is greater than LOADER_VERSION, the context asks the agent to
-# tell the user to re-run the installer, and the status line says so too.
+# loader-version is greater than LOADER_VERSION, the status line tells the user
+# how to upgrade. Cursor and Copilot have no status line, so for them the
+# context asks the agent to tell the user instead.
 #
 # AGENT_GUIDANCE_URL overrides the repository URL (mirrors, tests).
 # AGENT_GUIDANCE_BACKGROUND_BUDGET overrides the time limit of the background
@@ -30,7 +31,7 @@
 # (awk, tr, find, touch); uses python3 for JSON escaping when it is available.
 
 # Must equal the loader-version file at the root of the guidance repository.
-LOADER_VERSION=3
+LOADER_VERSION=4
 
 # fd 3 keeps the real stdout for the JSON object. fd 1 becomes the real stderr,
 # so echo and git output are diagnostics. fd 2 goes to /dev/null: on macOS the
@@ -251,6 +252,9 @@ if [ -n "$serve" ]; then
 	*) [ "$latest" -le "$LOADER_VERSION" ] || outdated=$latest ;;
 	esac
 fi
+# The installer embeds the loader it writes, so it has to be updated first.
+upgrade="run cargo install --force --git https://github.com/paritytech/agent-guidance"
+upgrade="$upgrade agent-guidance-install, then agent-guidance-install, and commit"
 
 # The status line for the user. The commit comes from git's own records in the
 # cache, a local operation like the rev-parse calls above; run_git is not used
@@ -277,7 +281,7 @@ status_line() {
 		message="NOT loaded, no usable copy in .agent-guidance/"
 	fi
 	if [ -n "$outdated" ]; then
-		message="$message; loader out of date, re-run agent-guidance-install"
+		message="$message; loader v$LOADER_VERSION out of date (v$outdated available): $upgrade"
 	fi
 	printf 'parity-agent-guidance: %s\n' "$message"
 }
@@ -287,11 +291,11 @@ context() {
 		printf "Company agent guidance follows. Files it links to live under \`%s/\`.\n\n" \
 			"$cache"
 		cat "$cache/GUIDANCE.md"
-		if [ -n "$outdated" ]; then
+		if [ -n "$outdated" ] && [ -n "$notice_in_context" ]; then
 			printf '\n%s%s%s\n' \
 				"The agent-guidance loader committed in this repository is version" \
 				" $LOADER_VERSION; the current version is $outdated. Tell the user to" \
-				" update it by running agent-guidance-install."
+				" update it: $upgrade."
 		fi
 	else
 		printf '%s%s\n' \
@@ -367,6 +371,11 @@ END { printf "\"" }
 	printf '%s' "$out"
 }
 
+# Where a harness shows the status line, the out-of-date notice goes only there.
+notice_in_context=
+case $harness in
+cursor | copilot) notice_in_context=1 ;;
+esac
 escaped=$(context | json_string)
 
 # Claude Code, Codex and Gemini CLI show a top-level systemMessage to the user.

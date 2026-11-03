@@ -95,7 +95,10 @@ field (see [What reaches the user](harnesses.md#what-reaches-the-user)).
   reach the screen. The stderr diagnostic keeps the full URL.
 - With a fresh cache, a failing background fetch does not show: it ends after the line is printed.
 - When the loader is out of date (see [Loader versions](#loader-versions)), the line ends with
-  `; loader out of date, re-run agent-guidance-install`.
+  `; loader v<N> out of date (v<M> available): run cargo install --force --git
+  https://github.com/paritytech/agent-guidance agent-guidance-install, then agent-guidance-install,
+  and commit`.
+  - `<N>` is the committed loader's version and `<M>` the fetched `loader-version`.
 - The line is escaped the same way as the context.
 
 ## Requirements
@@ -111,10 +114,15 @@ field (see [What reaches the user](harnesses.md#what-reaches-the-user)).
 - The `loader-version` file in this repository holds the current version.
 - Bump both together whenever `tools/templates/.agent-guidance-loader/load.sh` changes.
 - When the fetched `loader-version` is greater than the version of the committed loader, the
-  loader appends a line to the context.
-  - The line asks the agent to tell the user to update the loader by running
-    `agent-guidance-install`.
-  - The status line says the same.
-- A version bump means every downstream repository has to re-run the installer and commit the new
-  loader.
+  loader tells the user how to upgrade.
+  - In Claude Code, Codex and Gemini CLI the notice is at the end of the
+    [status line](#status-line), and the context does not mention it.
+  - Cursor and Copilot have no status line. For them the loader appends a line to the context
+    that asks the agent to tell the user the same steps.
+- The installer embeds the loader it writes, so the upgrade has two steps. See
+  [Upgrading the loader](installer.md#upgrading-the-loader).
+  1. Update the installer with
+     `cargo install --force --git https://github.com/paritytech/agent-guidance agent-guidance-install`.
+  2. Run `agent-guidance-install` in the repository and commit the result.
+- A version bump means every downstream repository has to upgrade and commit the new loader.
   - Until then its sessions show that notice.

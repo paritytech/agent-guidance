@@ -139,7 +139,7 @@ impl Repo {
 		);
 		assert_eq!(
 			String::from_utf8_lossy(&output.stdout),
-			"Nothing to change.\n"
+			format!("{}Nothing to change.\n", current())
 		);
 		assert_eq!(self.snapshot(), files);
 		assert_eq!(self.status(), status);
@@ -148,6 +148,33 @@ impl Repo {
 
 fn template(path: &str) -> String {
 	fs::read_to_string(Path::new(TEMPLATES).join(path)).expect("reading a template")
+}
+
+/// The `LOADER_VERSION` of the loader template, which the installer embeds.
+fn version() -> u32 {
+	template(LOADER)
+		.lines()
+		.find_map(|line| line.strip_prefix("LOADER_VERSION="))
+		.expect("the loader sets LOADER_VERSION")
+		.parse()
+		.expect("LOADER_VERSION is an integer")
+}
+
+/// The first line of the installer's output when the loader is already current.
+fn current() -> String {
+	format!("loader v{} (current)\n", version())
+}
+
+/// The loader template with its `LOADER_VERSION` line set to `value`.
+fn loader_with_version(value: &str) -> String {
+	let template = template(LOADER);
+	let loader = template.replacen(
+		&format!("\nLOADER_VERSION={}\n", version()),
+		&format!("\nLOADER_VERSION={value}\n"),
+		1,
+	);
+	assert_ne!(loader, template);
+	loader
 }
 
 fn stdout(output: &Output) -> String {
@@ -174,6 +201,10 @@ fn installs_into_an_empty_repository() {
 	assert_eq!(repo.read("CLAUDE.md"), format!("{FALLBACK}\n"));
 
 	let stdout = stdout(&output);
+	assert_eq!(
+		stdout.lines().next(),
+		Some(&*format!("loader ? -> v{}", version()))
+	);
 	for path in [
 		LOADER,
 		COPILOT_CONFIG,
@@ -279,7 +310,10 @@ fn leaves_an_unparsable_config_untouched() {
 	let files = repo.snapshot();
 	let output = repo.install();
 	assert!(!output.status.success());
-	assert_eq!(stdout(&output), "Nothing to change.\n");
+	assert_eq!(
+		stdout(&output),
+		format!("{}Nothing to change.\n", current())
+	);
 	assert_eq!(repo.snapshot(), files);
 }
 
@@ -368,11 +402,83 @@ fn upgrades_the_loader_and_restores_its_mode() {
 	let output = repo.install();
 	assert!(output.status.success());
 	assert_eq!(
-		stdout(&output).lines().nth(1),
-		Some(&*format!("  {LOADER}"))
+		stdout(&output).lines().take(3).collect::<Vec<_>>(),
+		[
+			&*format!("loader ? -> v{}", version()),
+			"Changed files:",
+			&format!("  {LOADER}")
+		]
 	);
 	repo.assert_hooks_installed();
 	repo.assert_second_run_changes_nothing();
+}
+
+#[test]
+fn reports_the_version_of_a_replaced_loader() {
+	let older = version() - 1;
+	for (existing, report) in [
+		(
+			loader_with_version(&older.to_string()),
+			format!("loader v{older} -> v{}", version()),
+		),
+		(
+			loader_with_version("abc"),
+			format!("loader ? -> v{}", version()),
+		),
+	] {
+		let repo = Repo::new();
+		assert!(repo.install().status.success());
+		repo.write(LOADER, &existing);
+		let output = repo.install();
+		assert!(
+			output.status.success(),
+			"{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		assert_eq!(
+			stdout(&output).lines().take(3).collect::<Vec<_>>(),
+			[&*report, "Changed files:", &format!("  {LOADER}")]
+		);
+		repo.assert_hooks_installed();
+		repo.assert_second_run_changes_nothing();
+	}
+}
+
+/// An installer built before a loader version bump writes nothing: its hook configs and other
+/// files may be as old as its loader.
+#[test]
+fn writes_nothing_over_a_newer_loader() {
+	// The second version overflows every integer type.
+	for newer in [
+		(version() + 1).to_string(),
+		"99999999999999999999999".to_owned(),
+	] {
+		let repo = Repo::new();
+		let loader = loader_with_version(&newer);
+		repo.write(LOADER, &loader);
+		fs::set_permissions(repo.root.join(LOADER), fs::Permissions::from_mode(0o755))
+			.expect("setting the mode");
+		let (path, event) = MERGED_CONFIGS[0];
+		let outdated = rewrite(&template_entry(path, event), "timeout", &Value::from(1));
+		repo.write(path, &config_with(event, &[outdated]));
+		repo.write("AGENTS.md", "# Project\n");
+		let files = repo.snapshot();
+
+		let output = repo.install();
+		assert_eq!(output.status.code(), Some(1), "v{newer}");
+		assert_eq!(
+			String::from_utf8_lossy(&output.stderr),
+			format!(
+				"error: {LOADER} is loader v{newer}, newer than v{} from this installer.\n\
+				 No file was changed. Update the installer and run it again:\n  \
+				 cargo install --force --git https://github.com/paritytech/agent-guidance \
+				 agent-guidance-install\n",
+				version()
+			)
+		);
+		assert_eq!(stdout(&output), "", "v{newer}");
+		assert_eq!(repo.snapshot(), files, "v{newer}");
+	}
 }
 
 /// A checkout made with umask 002 has the loader at 775; git sees no change, so neither does the
@@ -389,7 +495,10 @@ fn keeps_a_group_writable_executable_loader() {
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(stdout(&output), "Nothing to change.\n");
+	assert_eq!(
+		stdout(&output),
+		format!("{}Nothing to change.\n", current())
+	);
 	let mode = fs::metadata(&loader)
 		.expect("the loader exists")
 		.permissions();
@@ -410,8 +519,12 @@ fn restores_the_mode_of_a_current_loader() {
 		String::from_utf8_lossy(&output.stderr)
 	);
 	assert_eq!(
-		stdout(&output).lines().take(2).collect::<Vec<_>>(),
-		["Changed files:", &format!("  {LOADER}")]
+		stdout(&output).lines().take(3).collect::<Vec<_>>(),
+		[
+			current().trim_end(),
+			"Changed files:",
+			&format!("  {LOADER}")
+		]
 	);
 	assert!(stdout(&output).contains(&format!("git add {LOADER}\n")));
 	let mode = fs::metadata(&loader)
@@ -474,4 +587,38 @@ fn rejects_a_missing_root_and_extra_arguments() {
 		fs::read_dir(&repo.root).expect("reading the root").count(),
 		1
 	);
+}
+
+/// The loader entry of the template at `path` for `event`.
+fn template_entry(path: &str, event: &str) -> Value {
+	let config: Value = serde_json::from_str(&template(path)).expect("a JSON template");
+	config["hooks"][event][0].clone()
+}
+
+/// `value` with every value under `key`, at any depth, replaced by `new`.
+fn rewrite(value: &Value, key: &str, new: &Value) -> Value {
+	match value {
+		Value::Array(items) => Value::Array(items.iter().map(|v| rewrite(v, key, new)).collect()),
+		Value::Object(map) => Value::Object(
+			map.iter()
+				.map(|(k, v)| {
+					let v = if k == key {
+						new.clone()
+					} else {
+						rewrite(v, key, new)
+					};
+					(k.clone(), v)
+				})
+				.collect(),
+		),
+		other => other.clone(),
+	}
+}
+
+/// A config with another top-level key and `entries` as the `event` hooks.
+fn config_with(event: &str, entries: &[Value]) -> String {
+	let config = serde_json::json!({"model": "x", "hooks": {event: entries}});
+	let mut text = serde_json::to_string_pretty(&config).expect("serializing");
+	text.push('\n');
+	text
 }

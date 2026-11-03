@@ -38,6 +38,7 @@ agent-guidance-install
 - It adds cache entries to `.gitignore`.
 - It adds the fallback line below to `AGENTS.md` and `CLAUDE.md`.
 - It never commits. It prints the `git add` command to run.
+- To upgrade the loader, see [Upgrading the loader](docs/installer.md#upgrading-the-loader).
 
 The fallback line covers sessions where no hook delivers the guidance:
 
@@ -82,8 +83,8 @@ Every harness runs project hooks only after the workspace or folder is trusted o
 commands, so push access here is high-trust: a change steers the agents of everyone who loads it.
 
 - The loader fetches only text from this repository and never executes a fetched file.
-- Changes to the loader itself reach a repository only when a maintainer re-runs the installer
-  there and commits the result.
+- Changes to the loader itself reach a repository only when a maintainer updates the installer,
+  runs it there and commits the result.
 - `main` requires a PR with one approving review and passing CI, also for admins.
 
 ## Writing guidance
