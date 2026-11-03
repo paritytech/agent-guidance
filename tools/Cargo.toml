@@ -1,0 +1,14 @@
+[package]
+name = "agent-guidance-install"
+version = "0.1.0"
+edition = "2024"
+description = "Installs the agent guidance loader and hook configs into a repository"
+publish = false
+# Listed explicitly: the default file list skips the templates' dot directories.
+include = ["/Cargo.lock", "/rustfmt.toml", "/src/", "/templates/", "/tests/"]
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3"

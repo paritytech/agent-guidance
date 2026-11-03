@@ -1,0 +1,7 @@
+/tools/target/
+
+# Global excludes often ignore .claude/ and .codex/; the templates must stay tracked.
+!/tools/templates/.claude/
+!/tools/templates/.codex/
+/.agent-guidance/
+/.agent-guidance.tmp.*/
