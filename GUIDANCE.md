@@ -21,8 +21,6 @@ included.
   subagent explicitly.
 - Ask a needed decision when it comes up, with a recommendation. Do not re-ask settled ones.
 - Do not install toolchains or packages or change the machine setup without asking.
-- Never work in a git worktree. Never overwrite things the user edited by hand. No `/tmp` and no
-  other obscure "scratchpads". No `git stash`. Do nothing to obfuscate what you are doing.
 
 ### Git and PRs
 
