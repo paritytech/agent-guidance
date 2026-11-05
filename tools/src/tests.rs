@@ -122,6 +122,71 @@ fn fallback_is_wrapped_at_80_columns() {
 	assert!(FALLBACK.contains("agent-guidance"));
 }
 
+#[test]
+fn lists_ancestors_from_the_top_down() {
+	assert_eq!(
+		ancestors(".github/hooks/agent-guidance.json"),
+		[".github", ".github/hooks"]
+	);
+	assert_eq!(ancestors(".claude/settings.json"), [".claude"]);
+	assert!(ancestors("AGENTS.md").is_empty());
+}
+
+#[test]
+fn reincludes_an_ignored_file_and_its_ignored_directories() {
+	assert_eq!(
+		reinclude_lines(".claude/settings.json", &[".claude"]),
+		["!/.claude/", "/.claude/*", "!/.claude/settings.json"]
+	);
+	assert_eq!(
+		reinclude_lines(
+			".github/hooks/agent-guidance.json",
+			&[".github", ".github/hooks"]
+		),
+		[
+			"!/.github/",
+			"/.github/*",
+			"!/.github/hooks/",
+			"/.github/hooks/*",
+			"!/.github/hooks/agent-guidance.json"
+		]
+	);
+	assert_eq!(
+		reinclude_lines(".codex/hooks.json", &[]),
+		["!/.codex/hooks.json"]
+	);
+}
+
+#[test]
+fn adds_an_exclude_group_unless_it_is_there_in_order() {
+	let group = reinclude_lines(".codex/hooks.json", &[".codex"]);
+	let groups = [group.clone()];
+	let block = format!("{}\n", group.join("\n"));
+
+	assert_eq!(add_exclude_groups("", &groups), Some(block.clone()));
+	assert_eq!(
+		add_exclude_groups("/.codex/", &groups),
+		Some(format!("/.codex/\n{block}"))
+	);
+	assert_eq!(add_exclude_groups(&block, &groups), None);
+	assert_eq!(
+		add_exclude_groups(&format!("# local\n{block}/target/\n"), &groups),
+		None
+	);
+
+	// The same lines out of order or apart do not count.
+	let reordered = "!/.codex/hooks.json\n!/.codex/\n/.codex/*\n";
+	assert_eq!(
+		add_exclude_groups(reordered, &groups),
+		Some(format!("{reordered}{block}"))
+	);
+	let apart = "!/.codex/\n/.codex/*\n/.codex/x\n!/.codex/hooks.json\n";
+	assert_eq!(
+		add_exclude_groups(apart, &groups),
+		Some(format!("{apart}{block}"))
+	);
+}
+
 /// `FALLBACK` followed by a blank line and `text`.
 fn with_fallback(text: &str) -> String {
 	format!("{FALLBACK}\n\n{text}")

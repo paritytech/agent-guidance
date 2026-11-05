@@ -36,6 +36,8 @@ agent-guidance-install
 
 - The installer writes the loader and one hook config per harness.
 - It adds cache entries to `.gitignore`.
+- When git ignores a hook config, for example through a global excludes file, it re-includes the
+  config in the clone's local `.git/info/exclude`, which is not committed.
 - It puts the fallback line below at the top of `AGENTS.md` and makes `CLAUDE.md` import
   `AGENTS.md`.
 - It never commits. It prints the `git add` command to run.

@@ -567,10 +567,250 @@ fn keeps_a_linked_claude_md_that_imports_agents_md() {
 	repo.assert_second_run_changes_nothing();
 }
 
+/// Runs `git check-ignore` on `path` in `repo` and returns whether git ignores it.
+fn git_ignores(repo: &Repo, path: &str) -> bool {
+	let output = isolate(Command::new("git").arg("-C").arg(&repo.root).args([
+		"check-ignore",
+		"-q",
+		"--",
+		path,
+	]))
+	.output()
+	.expect("running git check-ignore");
+	match output.status.code() {
+		Some(0) => true,
+		Some(1) => false,
+		_ => panic!(
+			"git check-ignore {path}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		),
+	}
+}
+
+/// Sets `core.excludesFile` of `repo` to a file with `patterns`, like a global excludes file.
+fn exclude_globally(repo: &Repo, patterns: &str) {
+	let excludes = repo.root.join(".git/global-excludes");
+	fs::write(&excludes, patterns).expect("writing the excludes file");
+	git(
+		&repo.root,
+		&["config", "core.excludesFile", &excludes.to_string_lossy()],
+	);
+}
+
+const EXCLUDE: &str = ".git/info/exclude";
+
+/// Runs the installer, asserts that it succeeds without warnings, that it reports the exclude
+/// file, and that the tracked `.gitignore` holds only the cache lines.
+fn assert_reincluded(repo: &Repo) {
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+	let stdout = stdout(&output);
+	assert!(
+		stdout.contains(&format!("Re-included ignored hook configs in {EXCLUDE}")),
+		"{stdout}"
+	);
+	assert!(!stdout.contains(&format!("  {EXCLUDE}\n")), "{stdout}");
+	assert!(!stdout.contains(&format!(" {EXCLUDE} ")), "{stdout}");
+	assert!(!stdout.contains("git add -f"), "{stdout}");
+	assert_eq!(repo.read(".gitignore"), GITIGNORE_LINES);
+	for path in MERGED_CONFIGS
+		.map(|(path, _)| path)
+		.iter()
+		.chain([&COPILOT_CONFIG])
+	{
+		assert!(!git_ignores(repo, path), "{path}");
+	}
+	let exclude = repo.read(EXCLUDE);
+	repo.assert_second_run_changes_nothing();
+	assert_eq!(repo.read(EXCLUDE), exclude);
+}
+
+/// A global excludes file that ignores `.claude/` and `.codex/` would keep the hook configs out
+/// of a plain `git add`. The installer re-includes them in the local exclude file, not in the
+/// shared `.gitignore`, and keeps the rest of each directory ignored.
+#[test]
+fn reincludes_hook_configs_that_git_ignores() {
+	let repo = Repo::new();
+	exclude_globally(&repo, ".claude/\n.codex/\n");
+	assert!(git_ignores(&repo, ".claude/settings.json"));
+	let exclude = repo.read(EXCLUDE);
+
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		format!(
+			"{exclude}!/.claude/\n/.claude/*\n!/.claude/settings.json\n\
+			 !/.codex/\n/.codex/*\n!/.codex/hooks.json\n"
+		)
+	);
+	assert!(git_ignores(&repo, ".codex/worktrees/x"));
+	assert!(git_ignores(&repo, ".claude/settings.local.json"));
+}
+
+/// The lines come after an existing `/.codex/` line in the exclude file, so they win.
+#[test]
+fn reincludes_a_hook_config_that_the_exclude_file_ignores() {
+	let repo = Repo::new();
+	repo.write(EXCLUDE, "/.codex/\n");
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		"/.codex/\n!/.codex/\n/.codex/*\n!/.codex/hooks.json\n"
+	);
+	assert!(git_ignores(&repo, ".codex/worktrees/x"));
+}
+
+/// Only an ignored directory gets the lines that re-include it and ignore the rest of it.
+#[test]
+fn reincludes_an_ignored_hook_config_in_a_directory_git_does_not_ignore() {
+	let repo = Repo::new();
+	repo.write(EXCLUDE, "agent-guidance.json\n");
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		"agent-guidance.json\n!/.github/hooks/agent-guidance.json\n"
+	);
+}
+
+/// Every ignored directory above the file is re-included, from the top down.
+#[test]
+fn reincludes_a_hook_config_below_an_ignored_ancestor() {
+	let repo = Repo::new();
+	exclude_globally(&repo, ".github/\n");
+	let exclude = repo.read(EXCLUDE);
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		format!(
+			"{exclude}!/.github/\n/.github/*\n!/.github/hooks/\n/.github/hooks/*\n\
+			 !/.github/hooks/agent-guidance.json\n"
+		)
+	);
+	assert!(git_ignores(&repo, ".github/workflows/ci.yml"));
+}
+
+/// The group is added again unless it is already there as a whole and in order: a file line
+/// before the directory lines does not re-include the file.
+#[test]
+fn adds_the_whole_group_when_its_lines_are_out_of_order() {
+	let repo = Repo::new();
+	let existing = "/.codex/\n!/.codex/hooks.json\n!/.codex/\n/.codex/*\n";
+	repo.write(EXCLUDE, existing);
+	assert!(git_ignores(&repo, ".codex/hooks.json"));
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		format!("{existing}!/.codex/\n/.codex/*\n!/.codex/hooks.json\n")
+	);
+}
+
+/// In a linked worktree the lines go to the exclude file that git reads there.
+#[test]
+fn reincludes_hook_configs_in_a_linked_worktree() {
+	let repo = Repo::new();
+	git(
+		&repo.root,
+		&["commit", "-q", "--allow-empty", "-m", "initial"],
+	);
+	let dir = tempdir();
+	let worktree = dir.path().join("worktree");
+	git(
+		&repo.root,
+		&["worktree", "add", "-q", &worktree.to_string_lossy()],
+	);
+	exclude_globally(&repo, ".claude/\n");
+
+	let output = isolate(Command::new(INSTALLER).arg(&worktree))
+		.output()
+		.expect("running the installer");
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+	let exclude = git(&worktree, &["rev-parse", "--git-path", "info/exclude"]);
+	let exclude = worktree.join(exclude.trim_end());
+	let text = fs::read_to_string(&exclude).expect("reading the exclude file");
+	assert!(
+		text.ends_with("!/.claude/\n/.claude/*\n!/.claude/settings.json\n"),
+		"{text}"
+	);
+	let ignored = isolate(Command::new("git").arg("-C").arg(&worktree).args([
+		"check-ignore",
+		"-q",
+		".claude/settings.json",
+	]))
+	.status()
+	.expect("running git check-ignore");
+	assert_eq!(ignored.code(), Some(1));
+}
+
+/// When the lines do not help, because the repository's own `.gitignore` ignores the hook
+/// config, the installer warns and does not claim to have re-included it.
+#[test]
+fn does_not_report_a_reinclude_that_has_no_effect() {
+	let repo = Repo::new();
+	repo.write(".gitignore", ".claude/\n");
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	let stdout = stdout(&output);
+	assert!(!stdout.contains("Re-included"), "{stdout}");
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("warning: git ignores .claude/settings.json"),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(git_ignores(&repo, ".claude/settings.json"));
+	repo.assert_second_run_changes_nothing();
+}
+
+/// Exclude lines are anchored at the top level, so below it the installer only warns.
+#[test]
+fn leaves_the_exclude_file_alone_below_the_top_level() {
+	let repo = Repo::new();
+	exclude_globally(&repo, ".claude/\n");
+	let exclude = repo.read(EXCLUDE);
+	let sub = repo.root.join("sub");
+	fs::create_dir(&sub).expect("creating a directory");
+
+	let output = isolate(Command::new(INSTALLER).arg(&sub))
+		.output()
+		.expect("running the installer");
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(repo.read(EXCLUDE), exclude);
+	assert!(
+		!stdout(&output).contains("Re-included"),
+		"{}",
+		stdout(&output)
+	);
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("warning: git ignores .claude/settings.json"),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+}
+
+/// A tracked `.gitignore` takes precedence over the lines the installer adds to the exclude file.
 #[test]
 fn warns_about_ignored_files() {
 	let repo = Repo::new();
-	repo.write(".git/info/exclude", ".codex/\n");
+	repo.write(".codex/.gitignore", "*\n");
 	let output = repo.install();
 	assert!(
 		output.status.success(),

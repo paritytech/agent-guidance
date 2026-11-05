@@ -40,6 +40,25 @@ repository, and leaves committing to the maintainer.
 - It always writes `.github/hooks/agent-guidance.json` from the template.
 - It adds `/.agent-guidance/` and `/.agent-guidance.tmp.*/` to `.gitignore` unless equivalent lines
   exist.
+- When git ignores a hook config, for example through a global excludes file with `.claude/` or
+  `.codex/`, it adds lines that make git track the config to the clone's local exclude file
+  (`.git/info/exclude`, as `git rev-parse --git-path info/exclude` finds it).
+  - The shared `.gitignore` is not changed, since it must not encode one person's global
+    excludes. The exclude file is not committed and is not listed in the `git add` command.
+  - Git cannot re-include a file in an excluded directory. For each ignored directory above the
+    file, from the top down, it adds two lines that re-include the directory and ignore
+    everything else in it, such as `!/.claude/` and `/.claude/*`. The file line, such as
+    `!/.claude/settings.json`, comes last. Other files, such as `.codex/worktrees/`, stay
+    ignored.
+  - When only the file is ignored, it adds just the file line.
+  - The lines come after existing ones, so they win over an earlier `/.codex/` line in the
+    exclude file.
+  - A group of lines is added again unless it already appears as a whole, in the same order.
+  - The exclude file takes precedence over `core.excludesFile` but not over a tracked
+    `.gitignore`. When the repository's own `.gitignore` ignores a hook config, that rule wins
+    and the warning below shows.
+  - The lines are anchored at the top level. When ROOT is a directory below it, the installer
+    leaves the exclude file alone, and the warning below shows.
 - It puts the fallback line at the top of `AGENTS.md`, followed by a blank line and the existing
   text, unless the file already mentions `agent-guidance`.
   - The line is quoted in the [README](../README.md#installing-in-a-repository).
@@ -94,9 +113,11 @@ Commit the changed files it lists. The first line of its output reports the load
 - It never commits.
 - It reports the loader version, then lists the changed files and the `git add` command to run.
 - A second run changes nothing.
-- It warns when git ignores one of the files it wrote. Add such a file with `git add -f`.
-  - A local `.codex/` exclude can cause this.
-  - A global gitignore that ignores `.claude/` or `.codex/` triggers the same warning.
+- It warns when git still ignores one of the files it wrote. Add such a file with `git add -f`.
+  - A tracked `.gitignore` that ignores the file can cause this, since it takes precedence over
+    the lines added to the exclude file.
+- It reports when lines it added to the local exclude file made git track a hook config. That
+  file is not committed.
 
 ## Publishing
 

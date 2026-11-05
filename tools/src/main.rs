@@ -3,8 +3,9 @@
 //! Usage: `agent-guidance-install [ROOT]`, where ROOT is the repository root and defaults to the
 //! top level of the git repository that contains the current directory. The installer writes
 //! `.agent-guidance-loader/load.sh`, adds a SessionStart hook that runs it to the config of each
-//! supported harness, ignores the `.agent-guidance/` cache and the loader's temporary clones, puts
-//! a fallback paragraph at the top of `AGENTS.md`, and makes `CLAUDE.md` import `AGENTS.md`.
+//! supported harness, ignores the `.agent-guidance/` cache and the loader's temporary clones,
+//! re-includes hook configs that git ignores in the local exclude file, puts a fallback paragraph
+//! at the top of `AGENTS.md`, and makes `CLAUDE.md` import `AGENTS.md`.
 //! Running it again changes nothing unless the templates changed. It never commits; it prints the
 //! files to review and add.
 
@@ -272,6 +273,69 @@ fn merge_hook(existing: &str, template: &str, event: &str) -> Result<Option<Stri
 	Ok(Some(text))
 }
 
+/// Paths of all hook configs the installer writes.
+const HOOK_CONFIG_PATHS: [&str; 5] = [
+	HOOK_CONFIGS[0].0,
+	HOOK_CONFIGS[1].0,
+	HOOK_CONFIGS[2].0,
+	HOOK_CONFIGS[3].0,
+	COPILOT_CONFIG.0,
+];
+
+/// Directories that contain `path`, from the top down: `.github` and then `.github/hooks` for
+/// `.github/hooks/agent-guidance.json`.
+fn ancestors(path: &str) -> Vec<&str> {
+	let mut dirs: Vec<&str> = Path::new(path)
+		.ancestors()
+		.skip(1)
+		.filter_map(Path::to_str)
+		.filter(|dir| !dir.is_empty())
+		.collect();
+	dirs.reverse();
+	dirs
+}
+
+/// Exclude lines that make git track the hook config `path` that it ignores.
+///
+/// Git cannot re-include a file whose directory is excluded. So each ignored directory above
+/// the file (`ignored_dirs`, from the top down) is re-included and everything else in it, for
+/// example `.codex/worktrees/`, ignored again before the file is re-included.
+fn reinclude_lines(path: &str, ignored_dirs: &[&str]) -> Vec<String> {
+	let mut lines = Vec::new();
+	for dir in ignored_dirs {
+		lines.push(format!("!/{dir}/"));
+		lines.push(format!("/{dir}/*"));
+	}
+	lines.push(format!("!/{path}"));
+	lines
+}
+
+/// Appends each group of lines to the exclude file contents `text` unless the whole group is
+/// already there as consecutive lines in the same order. Returns `None` when nothing is added.
+///
+/// The last matching pattern wins, so a group whose lines are present but out of order may
+/// not re-include its file and is added again as a whole.
+fn add_exclude_groups(text: &str, groups: &[Vec<String>]) -> Option<String> {
+	let mut new = text.to_owned();
+	for group in groups {
+		let lines: Vec<&str> = new.lines().map(str::trim_end).collect();
+		if lines
+			.windows(group.len())
+			.any(|window| window == group.as_slice())
+		{
+			continue;
+		}
+		if !new.is_empty() && !new.ends_with('\n') {
+			new.push('\n');
+		}
+		for line in group {
+			new.push_str(line);
+			new.push('\n');
+		}
+	}
+	(new != text).then_some(new)
+}
+
 /// Whether the `.gitignore` contents `text` already hold `line` or an equivalent line.
 ///
 /// A line counts as present with or without the leading and trailing slash. Git ignores trailing
@@ -317,6 +381,45 @@ impl Installer {
 			self.changed.push(path);
 		}
 		Ok(())
+	}
+
+	/// Returns the paths among `paths` that git ignores, as `git check-ignore` prints them.
+	///
+	/// Outside a git repository the check fails and nothing is returned.
+	fn ignored(&self, paths: &[&str]) -> Vec<String> {
+		Command::new("git")
+			.arg("-C")
+			.arg(&self.root)
+			.args(["check-ignore", "--"])
+			.args(paths)
+			.stdin(Stdio::null())
+			.output()
+			.map(|output| {
+				String::from_utf8_lossy(&output.stdout)
+					.lines()
+					.map(str::to_owned)
+					.collect()
+			})
+			.unwrap_or_default()
+	}
+
+	/// Runs git with `args` in `root` and returns its output without the final line break, or
+	/// `None` when git fails, for example outside a git repository.
+	///
+	/// A path that `rev-parse --git-path` prints is relative to `root` unless it is absolute, as
+	/// in a linked worktree.
+	fn git(&self, args: &[&str]) -> Option<String> {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(&self.root)
+			.args(args)
+			.stdin(Stdio::null())
+			.stderr(Stdio::null())
+			.output()
+			.ok()
+			.filter(|output| output.status.success())?;
+		let text = String::from_utf8(output.stdout).ok()?;
+		Some(text.strip_suffix('\n').unwrap_or(&text).to_owned())
 	}
 
 	/// Appends `line` to `path`, creating the file when it is missing.
@@ -476,6 +579,9 @@ fn main() -> ExitCode {
 		}
 	}
 	let mut failed = false;
+	// The local exclude file, when this run changed it and so made git track a hook config that
+	// it ignored. The file is not committed.
+	let mut reincluded = None;
 	let result = (|| -> Result<(), String> {
 		installer.write(LOADER_PATH, LOADER)?;
 		let mut permissions = fs::metadata(&loader)
@@ -519,6 +625,54 @@ fn main() -> ExitCode {
 			}
 		}
 
+		// A global excludes file that ignores `.claude/` or `.codex/` would keep a hook config
+		// out of a plain `git add`. The lines that re-include it go to the local exclude file:
+		// the shared `.gitignore` must not encode one person's global excludes. The exclude file
+		// takes precedence over `core.excludesFile` but not over a tracked `.gitignore`, so a
+		// rule of the repository itself still wins and the warning below still shows. The lines
+		// are anchored at the top level, so below it the step is skipped and only the warning
+		// shows.
+		let at_top_level = installer
+			.git(&["rev-parse", "--show-prefix"])
+			.is_some_and(|prefix| prefix.is_empty());
+		let ignored_hooks = installer.ignored(&HOOK_CONFIG_PATHS);
+		let groups: Vec<Vec<String>> = ignored_hooks
+			.iter()
+			.map(|path| {
+				let dirs: Vec<&str> = ancestors(path)
+					.into_iter()
+					.filter(|dir| !installer.ignored(&[&format!("{dir}/")]).is_empty())
+					.collect();
+				reinclude_lines(path, &dirs)
+			})
+			.collect();
+		if let Some(exclude) = installer
+			.git(&["rev-parse", "--git-path", "info/exclude"])
+			.filter(|exclude| at_top_level && !groups.is_empty() && !exclude.is_empty())
+		{
+			let full = installer.root.join(&exclude);
+			let text = match fs::read_to_string(&full) {
+				Ok(text) => text,
+				Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+				Err(e) => return Err(format!("reading {exclude}: {e}")),
+			};
+			if let Some(new) = add_exclude_groups(&text, &groups) {
+				if let Some(parent) = full.parent() {
+					fs::create_dir_all(parent)
+						.map_err(|e| format!("creating {}: {e}", parent.display()))?;
+				}
+				fs::write(&full, new).map_err(|e| format!("writing {exclude}: {e}"))?;
+				// The lines may not help, for example against the repository's `.gitignore`.
+				let still_ignored = installer.ignored(&HOOK_CONFIG_PATHS);
+				if ignored_hooks
+					.iter()
+					.any(|path| !still_ignored.contains(path))
+				{
+					reincluded = Some(exclude);
+				}
+			}
+		}
+
 		for (path, text) in &writes {
 			installer.write(path, text)?;
 		}
@@ -529,8 +683,8 @@ fn main() -> ExitCode {
 		return ExitCode::FAILURE;
 	}
 
-	// An installed file that git ignores, for example through a local `.codex/` exclude, is
-	// missed by a plain `git add`. Outside a git repository the check fails and is skipped.
+	// An installed file that git still ignores, for example through a `.gitignore` in its
+	// directory, is missed by a plain `git add`.
 	let installed = [
 		LOADER_PATH,
 		HOOK_CONFIGS[0].0,
@@ -542,27 +696,22 @@ fn main() -> ExitCode {
 		"AGENTS.md",
 		"CLAUDE.md",
 	];
-	let ignored: Vec<String> = Command::new("git")
-		.arg("-C")
-		.arg(&installer.root)
-		.args(["check-ignore", "--"])
-		.args(installed)
-		.output()
-		.map(|output| {
-			String::from_utf8_lossy(&output.stdout)
-				.lines()
-				.map(str::to_owned)
-				.collect()
-		})
-		.unwrap_or_default();
+	let ignored = installer.ignored(&installed);
 	for path in &ignored {
 		eprintln!("warning: git ignores {path}; add it with `git add -f {path}`");
 	}
 
 	println!("{loader_report}");
-	if installer.changed.is_empty() {
+	if installer.changed.is_empty() && reincluded.is_none() {
 		println!("Nothing to change.");
-	} else {
+	}
+	if let Some(exclude) = &reincluded {
+		println!(
+			"Re-included ignored hook configs in {exclude}, which is local to this clone and \
+			 not committed."
+		);
+	}
+	if !installer.changed.is_empty() {
 		println!("Changed files:");
 		for path in &installer.changed {
 			println!("  {path}");
