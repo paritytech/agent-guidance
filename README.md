@@ -13,8 +13,8 @@ internals are in [docs/loader.md](docs/loader.md).
 - The loader fetches this repository into `.agent-guidance/` and injects `GUIDANCE.md`.
 - Changes merged here reach every repository without a change downstream.
 - A session fetches updates in the background, and the session after it uses them.
-- Where no hook delivers the guidance, the [fallback line](#installing-in-a-repository) in
-  `AGENTS.md` and `CLAUDE.md` points the agent to it.
+- Where no hook delivers the guidance, the [fallback line](#installing-in-a-repository) at the
+  top of `AGENTS.md` points the agent to it. `CLAUDE.md` imports `AGENTS.md`.
 
 ## Why a loader
 
@@ -36,7 +36,8 @@ agent-guidance-install
 
 - The installer writes the loader and one hook config per harness.
 - It adds cache entries to `.gitignore`.
-- It adds the fallback line below to `AGENTS.md` and `CLAUDE.md`.
+- It puts the fallback line below at the top of `AGENTS.md` and makes `CLAUDE.md` import
+  `AGENTS.md`.
 - It never commits. It prints the `git add` command to run.
 - To upgrade the loader, see [Upgrading the loader](docs/installer.md#upgrading-the-loader).
 

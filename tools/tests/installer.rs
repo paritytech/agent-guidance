@@ -55,6 +55,11 @@ impl Repo {
 		fs::write(full, contents).expect("writing a file");
 	}
 
+	/// Creates the symbolic link `path` pointing to `target`.
+	fn symlink(&self, target: &str, path: &str) {
+		std::os::unix::fs::symlink(target, self.root.join(path)).expect("creating a symlink");
+	}
+
 	fn read(&self, path: &str) -> String {
 		fs::read_to_string(self.root.join(path)).unwrap_or_else(|e| panic!("reading {path}: {e}"))
 	}
@@ -70,7 +75,8 @@ impl Repo {
 			.expect("running the installer")
 	}
 
-	/// Contents and modes of every file outside `.git`, keyed by relative path.
+	/// Contents and modes of every file outside `.git`, keyed by relative path. A symbolic link
+	/// is recorded with its target as contents.
 	fn snapshot(&self) -> BTreeMap<PathBuf, (Vec<u8>, u32)> {
 		let mut files = BTreeMap::new();
 		let mut pending = vec![self.root.clone()];
@@ -80,19 +86,22 @@ impl Repo {
 				if path.file_name().is_some_and(|name| name == ".git") {
 					continue;
 				}
-				if path.is_dir() {
+				let metadata = fs::symlink_metadata(&path).expect("reading metadata");
+				if metadata.is_dir() {
 					pending.push(path);
-				} else {
-					let mode = fs::metadata(&path)
-						.expect("reading metadata")
-						.permissions()
-						.mode();
-					let relative = path
-						.strip_prefix(&self.root)
-						.expect("below the root")
-						.to_owned();
-					files.insert(relative, (fs::read(&path).expect("reading a file"), mode));
+					continue;
 				}
+				let contents = if metadata.is_symlink() {
+					let target = fs::read_link(&path).expect("reading a link");
+					target.into_os_string().into_encoded_bytes()
+				} else {
+					fs::read(&path).expect("reading a file")
+				};
+				let relative = path
+					.strip_prefix(&self.root)
+					.expect("below the root")
+					.to_owned();
+				files.insert(relative, (contents, metadata.permissions().mode()));
 			}
 		}
 		files
@@ -198,7 +207,7 @@ fn installs_into_an_empty_repository() {
 	repo.assert_hooks_installed();
 	assert_eq!(repo.read(".gitignore"), GITIGNORE_LINES);
 	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n"));
-	assert_eq!(repo.read("CLAUDE.md"), format!("{FALLBACK}\n"));
+	assert_eq!(repo.read("CLAUDE.md"), "@AGENTS.md\n");
 
 	let stdout = stdout(&output);
 	assert_eq!(
@@ -257,7 +266,7 @@ fn preserves_existing_content() {
 	);
 	repo.assert_hooks_installed();
 
-	assert_eq!(repo.read("AGENTS.md"), format!("{agents}\n\n{FALLBACK}\n"));
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n\n{agents}"));
 	assert_eq!(repo.read("CLAUDE.md"), claude);
 	assert_eq!(
 		repo.read(".gitignore"),
@@ -371,6 +380,190 @@ fn keeps_an_earlier_single_line_fallback() {
 	);
 	assert_eq!(repo.read("AGENTS.md"), existing);
 	assert_eq!(repo.read("CLAUDE.md"), existing);
+	repo.assert_second_run_changes_nothing();
+}
+
+#[test]
+fn moves_a_lone_claude_md_into_agents_md() {
+	let repo = Repo::new();
+	let claude = "# Project\n\nBuild with make.\n";
+	repo.write("CLAUDE.md", claude);
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n\n{claude}"));
+	assert_eq!(repo.read("CLAUDE.md"), "@AGENTS.md\n");
+	repo.assert_second_run_changes_nothing();
+}
+
+/// Merging two sets of instructions is left to the maintainer, and the refusal comes before any
+/// write.
+#[test]
+fn writes_nothing_when_claude_md_does_not_import_agents_md() {
+	let repo = Repo::new();
+	repo.write("AGENTS.md", "# Project\n");
+	repo.write("CLAUDE.md", "# Claude\n");
+	let files = repo.snapshot();
+
+	let output = repo.install();
+	assert_eq!(output.status.code(), Some(1));
+	assert_eq!(
+		String::from_utf8_lossy(&output.stderr),
+		"error: AGENTS.md and CLAUDE.md both exist and CLAUDE.md does not import AGENTS.md.\n\
+		 No file was changed. Merge CLAUDE.md into AGENTS.md, replace CLAUDE.md with the line \
+		 @AGENTS.md, and run the installer again.\n"
+	);
+	assert_eq!(stdout(&output), "");
+	assert_eq!(repo.snapshot(), files);
+}
+
+/// A `CLAUDE.md` that links to `AGENTS.md` already gives Claude Code the same instructions, also
+/// when `AGENTS.md` does not exist yet.
+#[test]
+fn keeps_a_claude_md_that_links_to_agents_md() {
+	for (agents, link) in [
+		(Some("# Project\n\nBuild with make.\n"), "AGENTS.md"),
+		(Some(""), "AGENTS.md"),
+		(None, "AGENTS.md"),
+		(None, "./AGENTS.md"),
+	] {
+		let repo = Repo::new();
+		if let Some(agents) = agents {
+			repo.write("AGENTS.md", agents);
+		}
+		repo.symlink(link, "CLAUDE.md");
+		let output = repo.install();
+		assert!(
+			output.status.success(),
+			"{agents:?}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		let expected = match agents {
+			Some(agents) if !agents.is_empty() => format!("{FALLBACK}\n\n{agents}"),
+			_ => format!("{FALLBACK}\n"),
+		};
+		assert_eq!(repo.read("AGENTS.md"), expected, "{agents:?}");
+		let agents_md = fs::symlink_metadata(repo.root.join("AGENTS.md")).expect("AGENTS.md");
+		assert!(agents_md.file_type().is_file(), "{agents:?}");
+		assert_eq!(
+			fs::read_link(repo.root.join("CLAUDE.md")).expect("CLAUDE.md is still a symlink"),
+			Path::new(link)
+		);
+		assert!(!stdout(&output).contains("  CLAUDE.md\n"), "{agents:?}");
+		repo.assert_second_run_changes_nothing();
+	}
+}
+
+/// A hard link holds the same instructions under both names.
+#[test]
+fn keeps_a_claude_md_hard_linked_to_agents_md() {
+	let repo = Repo::new();
+	repo.write("AGENTS.md", "# Project\n");
+	fs::hard_link(repo.root.join("AGENTS.md"), repo.root.join("CLAUDE.md"))
+		.expect("creating a hard link");
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n\n# Project\n"));
+	assert_eq!(repo.read("CLAUDE.md"), repo.read("AGENTS.md"));
+	repo.assert_second_run_changes_nothing();
+}
+
+/// Writing through a link would change a file other than the one named.
+#[test]
+fn writes_nothing_through_a_link() {
+	// CLAUDE.md links elsewhere and would be replaced with the import.
+	let repo = Repo::new();
+	repo.write("docs/ai.md", "# Claude\n");
+	repo.symlink("docs/ai.md", "CLAUDE.md");
+	assert_refuses_link(&repo, "CLAUDE.md");
+
+	// CLAUDE.md links to AGENTS.md, which links elsewhere and would get the fallback.
+	let repo = Repo::new();
+	repo.write("docs/ai.md", "# Project\n");
+	repo.symlink("docs/ai.md", "AGENTS.md");
+	repo.symlink("AGENTS.md", "CLAUDE.md");
+	assert_refuses_link(&repo, "AGENTS.md");
+}
+
+/// An `AGENTS.md` that links to `CLAUDE.md` makes both names one file, so the fallback goes into
+/// `CLAUDE.md`, also when it does not exist yet.
+#[test]
+fn writes_through_an_agents_md_that_links_to_claude_md() {
+	for (claude, link) in [
+		(Some("# Project\n"), "CLAUDE.md"),
+		(None, "CLAUDE.md"),
+		(Some("# Project\n"), "./CLAUDE.md"),
+	] {
+		let repo = Repo::new();
+		if let Some(claude) = claude {
+			repo.write("CLAUDE.md", claude);
+		}
+		repo.symlink(link, "AGENTS.md");
+		let output = repo.install();
+		assert!(
+			output.status.success(),
+			"{claude:?}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		let expected = match claude {
+			Some(claude) => format!("{FALLBACK}\n\n{claude}"),
+			None => format!("{FALLBACK}\n"),
+		};
+		let claude_md = fs::symlink_metadata(repo.root.join("CLAUDE.md")).expect("CLAUDE.md");
+		assert!(claude_md.file_type().is_file(), "{claude:?}");
+		assert_eq!(repo.read("CLAUDE.md"), expected, "{claude:?}");
+		assert_eq!(
+			fs::read_link(repo.root.join("AGENTS.md")).expect("AGENTS.md is still a symlink"),
+			Path::new(link)
+		);
+		// The real file is listed for `git add`, not the unchanged link.
+		let stdout = stdout(&output);
+		assert!(stdout.contains("  CLAUDE.md\n"), "{stdout}");
+		assert!(stdout.contains(" CLAUDE.md"), "{stdout}");
+		assert!(!stdout.contains("AGENTS.md"), "{stdout}");
+		repo.assert_second_run_changes_nothing();
+	}
+}
+
+fn assert_refuses_link(repo: &Repo, link: &str) {
+	let files = repo.snapshot();
+	let output = repo.install();
+	assert_eq!(output.status.code(), Some(1), "{link}");
+	assert_eq!(
+		String::from_utf8_lossy(&output.stderr),
+		format!(
+			"error: {link} is a symbolic link, and the installer does not write through links.\n\
+			 No file was changed. Replace {link} with a regular file and run the installer again.\n"
+		)
+	);
+	assert_eq!(stdout(&output), "", "{link}");
+	assert_eq!(repo.snapshot(), files, "{link}");
+}
+
+/// A link that the installer does not need to write is fine.
+#[test]
+fn keeps_a_linked_claude_md_that_imports_agents_md() {
+	let repo = Repo::new();
+	repo.write("docs/ai.md", "@AGENTS.md\n\nUse Opus for reviews.\n");
+	repo.symlink("docs/ai.md", "CLAUDE.md");
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n"));
+	assert_eq!(
+		fs::read_link(repo.root.join("CLAUDE.md")).expect("CLAUDE.md is still a symlink"),
+		Path::new("docs/ai.md")
+	);
 	repo.assert_second_run_changes_nothing();
 }
 

@@ -3,16 +3,20 @@
 //! Usage: `agent-guidance-install [ROOT]`, where ROOT is the repository root and defaults to the
 //! top level of the git repository that contains the current directory. The installer writes
 //! `.agent-guidance-loader/load.sh`, adds a SessionStart hook that runs it to the config of each
-//! supported harness, ignores the `.agent-guidance/` cache and the loader's temporary clones, and
-//! adds a fallback line to `AGENTS.md` and `CLAUDE.md`. Running it again changes nothing unless
-//! the templates changed. It never commits; it prints the files to review and add.
+//! supported harness, ignores the `.agent-guidance/` cache and the loader's temporary clones, puts
+//! a fallback paragraph at the top of `AGENTS.md`, and makes `CLAUDE.md` import `AGENTS.md`.
+//! Running it again changes nothing unless the templates changed. It never commits; it prints the
+//! files to review and add.
 
 use serde_json::{Map, Value};
 use std::{
 	ffi::OsStr,
 	fs, io,
-	os::unix::{ffi::OsStrExt, fs::PermissionsExt},
-	path::PathBuf,
+	os::unix::{
+		ffi::OsStrExt,
+		fs::{MetadataExt, PermissionsExt},
+	},
+	path::{Path, PathBuf},
 	process::{Command, ExitCode, Stdio},
 };
 
@@ -57,14 +61,72 @@ const COPILOT_CONFIG: (&str, &str) = (
 	include_str!("../templates/.github/hooks/agent-guidance.json"),
 );
 
-/// Paragraph added to `AGENTS.md` and `CLAUDE.md` for sessions where no hook delivers the
-/// guidance.
+/// Paragraph put at the top of `AGENTS.md` for sessions where no hook delivers the guidance.
 ///
-/// It is wrapped at 80 columns. A file that already mentions `agent-guidance`, including one
-/// holding the earlier single-line version of this paragraph, is left unchanged.
+/// `CLAUDE.md` gets it through [`CLAUDE_IMPORT`]. It is wrapped at 80 columns. A file that
+/// already mentions `agent-guidance`, including one holding an earlier version of this paragraph
+/// at its end, is left unchanged.
 const FALLBACK: &str = "Company agent guidance lives in `.agent-guidance/GUIDANCE.md`. If that\n\
 	directory is missing, clone https://github.com/paritytech/agent-guidance into\n\
 	`.agent-guidance/` and read it.";
+
+/// Contents of a `CLAUDE.md` written by the installer: Claude Code imports `AGENTS.md` from it.
+const CLAUDE_IMPORT: &str = "@AGENTS.md\n";
+
+/// Returns `text` with [`FALLBACK`] as its first paragraph.
+///
+/// Text that already mentions `agent-guidance` is returned unchanged, and text with nothing but
+/// whitespace is replaced. Otherwise the existing bytes follow the paragraph and a blank line.
+fn prepend_fallback(text: &str) -> String {
+	if text.contains("agent-guidance") {
+		text.to_owned()
+	} else if text.trim().is_empty() {
+		format!("{FALLBACK}\n")
+	} else {
+		format!("{FALLBACK}\n\n{text}")
+	}
+}
+
+/// Computes new contents for `AGENTS.md` and `CLAUDE.md` from their current contents, `None`
+/// meaning a missing file.
+///
+/// [`FALLBACK`] goes at the top of `AGENTS.md` (see [`prepend_fallback`]), and `CLAUDE.md`
+/// imports `AGENTS.md` with the line [`CLAUDE_IMPORT`].
+///
+/// - A `CLAUDE.md` that contains `@AGENTS.md` or `@./AGENTS.md` is kept, also when `AGENTS.md` is
+///   missing.
+/// - Otherwise, when `AGENTS.md` is missing or holds only whitespace, the content of `CLAUDE.md`
+///   moves into it.
+/// - A missing or empty `CLAUDE.md` is replaced with the import.
+/// - When `CLAUDE.md` does not import `AGENTS.md` but either file mentions `agent-guidance`, the
+///   repository holds an earlier install and both files are kept.
+///
+/// Returns the new contents of (`AGENTS.md`, `CLAUDE.md`), `None` where a file stays as it is.
+/// An error means that both files hold their own instructions; merging them is left to the
+/// maintainer.
+fn instruction_files(
+	agents: Option<&str>,
+	claude: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+	let new_agents = |text: &str| {
+		let new = prepend_fallback(text);
+		(agents != Some(new.as_str())).then_some(new)
+	};
+	let import = Some(CLAUDE_IMPORT.to_owned());
+	let Some(claude) = claude.filter(|text| !text.trim().is_empty()) else {
+		return Ok((new_agents(agents.unwrap_or_default()), import));
+	};
+	if claude.contains("@AGENTS.md") || claude.contains("@./AGENTS.md") {
+		return Ok((new_agents(agents.unwrap_or_default()), None));
+	}
+	let Some(agents) = agents.filter(|text| !text.trim().is_empty()) else {
+		return Ok((new_agents(claude), import));
+	};
+	if agents.contains("agent-guidance") || claude.contains("agent-guidance") {
+		return Ok((None, None));
+	}
+	Err("AGENTS.md and CLAUDE.md both exist and CLAUDE.md does not import AGENTS.md.".into())
+}
 
 /// Lines added to `.gitignore`: the cache and the loader's temporary clones.
 const GITIGNORE_LINES: [&str; 2] = ["/.agent-guidance/", "/.agent-guidance.tmp.*/"];
@@ -259,23 +321,16 @@ impl Installer {
 
 	/// Appends `line` to `path`, creating the file when it is missing.
 	///
-	/// A non-empty file is first terminated with a newline. With `paragraph` set, a blank line
-	/// separates the new line from the existing text.
+	/// A non-empty file is first terminated with a newline.
 	fn append(
 		&mut self,
 		path: &'static str,
 		existing: Option<&str>,
 		line: &str,
-		paragraph: bool,
 	) -> Result<(), String> {
 		let mut text = existing.unwrap_or_default().to_owned();
-		if !text.is_empty() {
-			if !text.ends_with('\n') {
-				text.push('\n');
-			}
-			if paragraph && !text.ends_with("\n\n") {
-				text.push('\n');
-			}
+		if !text.is_empty() && !text.ends_with('\n') {
+			text.push('\n');
 		}
 		text.push_str(line);
 		text.push('\n');
@@ -356,6 +411,70 @@ fn main() -> ExitCode {
 		root,
 		changed: Vec::new(),
 	};
+	// A refusal to merge AGENTS.md and CLAUDE.md, like a downgrade, leaves every file unchanged.
+	// When one name links to the other, including a dangling link, or both are hard links to one
+	// file, CLAUDE.md acts as an import and is never written; only AGENTS.md gets the fallback.
+	let file_id = |path| {
+		fs::metadata(installer.root.join(path))
+			.ok()
+			.map(|metadata| (metadata.dev(), metadata.ino()))
+	};
+	let links_to = |link, target: &str| {
+		fs::read_link(installer.root.join(link))
+			.is_ok_and(|to| to == Path::new(target) || to == Path::new(".").join(target))
+	};
+	let agents_links_to_claude = links_to("AGENTS.md", "CLAUDE.md");
+	let linked = agents_links_to_claude
+		|| links_to("CLAUDE.md", "AGENTS.md")
+		|| file_id("AGENTS.md").is_some_and(|agents| file_id("CLAUDE.md") == Some(agents));
+	let instructions = installer.read("AGENTS.md").and_then(|agents| {
+		let claude = if linked {
+			Some(CLAUDE_IMPORT.to_owned())
+		} else {
+			installer.read("CLAUDE.md")?
+		};
+		Ok(instruction_files(agents.as_deref(), claude.as_deref()))
+	});
+	let (agents_md, claude_md) = match instructions {
+		Ok(Ok(contents)) => contents,
+		Ok(Err(e)) => {
+			eprintln!(
+				"error: {e}\nNo file was changed. Merge CLAUDE.md into AGENTS.md, replace \
+				 CLAUDE.md with the line @AGENTS.md, and run the installer again."
+			);
+			return ExitCode::FAILURE;
+		}
+		Err(e) => {
+			eprintln!("error: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	// The new AGENTS.md of an AGENTS.md that links to CLAUDE.md goes into CLAUDE.md, so that the
+	// real file is written and listed. CLAUDE.md has no contents of its own then.
+	let writes: Vec<(&'static str, String)> = if agents_links_to_claude {
+		agents_md
+			.map(|text| ("CLAUDE.md", text))
+			.into_iter()
+			.collect()
+	} else {
+		[("AGENTS.md", agents_md), ("CLAUDE.md", claude_md)]
+			.into_iter()
+			.filter_map(|(path, text)| Some((path, text?)))
+			.collect()
+	};
+	// A write through a link would change the link's target, which can be any file, or create it.
+	for (path, _) in &writes {
+		let link = fs::symlink_metadata(installer.root.join(path))
+			.is_ok_and(|metadata| metadata.file_type().is_symlink());
+		if link {
+			eprintln!(
+				"error: {path} is a symbolic link, and the installer does not write through \
+				 links.\nNo file was changed. Replace {path} with a regular file and run the \
+				 installer again."
+			);
+			return ExitCode::FAILURE;
+		}
+	}
 	let mut failed = false;
 	let result = (|| -> Result<(), String> {
 		installer.write(LOADER_PATH, LOADER)?;
@@ -396,19 +515,12 @@ fn main() -> ExitCode {
 		for line in GITIGNORE_LINES {
 			let gitignore = installer.read(".gitignore")?;
 			if !gitignore.as_deref().is_some_and(|text| ignores(text, line)) {
-				installer.append(".gitignore", gitignore.as_deref(), line, false)?;
+				installer.append(".gitignore", gitignore.as_deref(), line)?;
 			}
 		}
 
-		for path in ["AGENTS.md", "CLAUDE.md"] {
-			let existing = installer.read(path)?;
-			let skip = existing.as_deref().is_some_and(|text| {
-				text.contains("agent-guidance")
-					|| (path == "CLAUDE.md" && text.contains("@AGENTS.md"))
-			});
-			if !skip {
-				installer.append(path, existing.as_deref(), FALLBACK, true)?;
-			}
+		for (path, text) in &writes {
+			installer.write(path, text)?;
 		}
 		Ok(())
 	})();

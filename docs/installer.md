@@ -40,10 +40,27 @@ repository, and leaves committing to the maintainer.
 - It always writes `.github/hooks/agent-guidance.json` from the template.
 - It adds `/.agent-guidance/` and `/.agent-guidance.tmp.*/` to `.gitignore` unless equivalent lines
   exist.
-- It adds the fallback line to `AGENTS.md` and `CLAUDE.md` unless they already mention
-  `agent-guidance`.
-  - `CLAUDE.md` is left alone when it imports `@AGENTS.md`.
+- It puts the fallback line at the top of `AGENTS.md`, followed by a blank line and the existing
+  text, unless the file already mentions `agent-guidance`.
   - The line is quoted in the [README](../README.md#installing-in-a-repository).
+- It makes `CLAUDE.md` import `AGENTS.md` with the line `@AGENTS.md`.
+  - A missing or empty `CLAUDE.md` is written with that line alone.
+  - A `CLAUDE.md` that contains `@AGENTS.md` or `@./AGENTS.md`, is a symbolic link to
+    `AGENTS.md` or `./AGENTS.md`, or is a hard link to `AGENTS.md`, is left alone, also when
+    `AGENTS.md` is missing.
+  - When `AGENTS.md` is missing or empty, the content of any other `CLAUDE.md` moves to
+    `AGENTS.md` below the fallback line, and `CLAUDE.md` is replaced with the import.
+  - When `CLAUDE.md` does not import `AGENTS.md` but either file mentions `agent-guidance`, both
+    files are left alone. Earlier installers added the fallback line to both files.
+  - When both files hold other instructions and `CLAUDE.md` does not import `AGENTS.md`, the
+    installer checks this before it writes anything, writes no file, and exits with status 1.
+    Merge `CLAUDE.md` into `AGENTS.md`, replace `CLAUDE.md` with the line `@AGENTS.md`, and run
+    the installer again.
+  - An `AGENTS.md` that is a symbolic link to `CLAUDE.md` makes both names one file. The
+    fallback line is written to `CLAUDE.md`, which is created when it is missing, and listed as
+    the changed file.
+  - It writes through no other symbolic link. When `AGENTS.md` or `CLAUDE.md` is another link it
+    would change, it writes no file and exits with status 1.
 
 ## Upgrading the loader
 
