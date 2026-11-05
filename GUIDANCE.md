@@ -21,13 +21,13 @@ included.
   subagent explicitly.
 - Ask a needed decision when it comes up, with a recommendation. Do not re-ask settled ones.
 - Do not install toolchains or packages or change the machine setup without asking.
-- Work in a git worktree, not the main checkout: the user edits there by hand. Put worktrees and
-  scratch files inside the repository under an ignored directory. No `git stash`.
+- Never work in a git worktree. Never overwrite things the user edited by hand. No `/tmp` and no
+  other obscure "scratchpads". No `git stash`. Do nothing to obfuscate what you are doing.
 
 ### Git and PRs
 
-- Commit locally as needed. Ask before anything remote: push, open, update or merge a PR, comment,
-  reply, file an issue. When asking, show inline the exact text that will go out (title, body,
+- Never commit anything. Ask before any state changing git operation: push, open, update or merge a PR,
+  comment, reply, file an issue. When asking, show inline the exact text that will go out (title, body,
   comment).
 - Never force-push, rebase or amend a branch with an open PR. Add commits on top, so reviewers keep
   their state.
@@ -61,6 +61,9 @@ included.
 - Test private behavior with unit tests. A test-only hook in production code is a last resort; keep
   it as small and unintrusive as possible.
 - Comments explain a non-obvious why. No history, dates or references to the session.
+- Never make inline comments that state what the code does. Use doc comments. Break functions up
+  if you find yourself writing inline comments. It's a huge code smells. Inline commends are barely
+  ever needed in a well designed code base.
 - Prove a fix with a test that fails before and passes after. Judge a run by its real exit code and
   per-test results, not a summary or a pipe's status.
 - Public text about a security fix states the new behavior, never that the old one was
