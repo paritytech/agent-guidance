@@ -21,6 +21,7 @@ included.
   subagent explicitly.
 - Ask a needed decision when it comes up, with a recommendation. Do not re-ask settled ones.
 - Do not install toolchains or packages or change the machine setup without asking.
+- No `git stash`, avoid scratchpads filling up disk space.
 
 ### Git and PRs
 
