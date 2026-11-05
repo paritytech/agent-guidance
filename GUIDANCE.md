@@ -60,7 +60,7 @@ included.
   it as small and unintrusive as possible.
 - Comments explain a non-obvious why. No history, dates or references to the session.
 - Never make inline comments that state what the code does. Use doc comments. Break functions up
-  if you find yourself writing inline comments. It's a huge code smells. Inline commends are barely
+  if you find yourself writing inline comments. It's a code smell. Inline commends are barely
   ever needed in a well designed code base.
 - Prove a fix with a test that fails before and passes after. Judge a run by its real exit code and
   per-test results, not a summary or a pipe's status.
