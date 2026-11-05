@@ -25,7 +25,7 @@ included.
 
 ### Git and PRs
 
-- Ask before any state changing git operation: push, open, update or merge a PR,
+- Ask before state changing git operation on remote: push, open, update or merge a PR,
   comment, reply, file an issue. When asking, show inline the exact text that will go out (title, body,
   comment).
 - Never force-push, rebase or amend a branch with an open PR. Add commits on top, so reviewers keep
