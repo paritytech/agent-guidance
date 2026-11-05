@@ -66,7 +66,8 @@ repository, and leaves committing to the maintainer.
   - A missing or empty `CLAUDE.md` is written with that line alone.
   - A `CLAUDE.md` that contains `@AGENTS.md` or `@./AGENTS.md`, is a symbolic link to
     `AGENTS.md` or `./AGENTS.md`, or is a hard link to `AGENTS.md`, is left alone, also when
-    `AGENTS.md` is missing.
+    `AGENTS.md` is missing. A hard-linked `CLAUDE.md` changes with `AGENTS.md`, so both are
+    listed as changed.
   - When `AGENTS.md` is missing or empty, the content of any other `CLAUDE.md` moves to
     `AGENTS.md` below the fallback line, and `CLAUDE.md` is replaced with the import.
   - When `CLAUDE.md` does not import `AGENTS.md` but either file mentions `agent-guidance`, both
@@ -78,8 +79,21 @@ repository, and leaves committing to the maintainer.
   - An `AGENTS.md` that is a symbolic link to `CLAUDE.md` makes both names one file. The
     fallback line is written to `CLAUDE.md`, which is created when it is missing, and listed as
     the changed file.
-  - It writes through no other symbolic link. When `AGENTS.md` or `CLAUDE.md` is another link it
-    would change, it writes no file and exits with status 1.
+
+## Symbolic links
+
+The installer plans every write before it writes anything, and never writes through a symbolic
+link.
+
+- A file counts as written when its planned contents differ from what is on disk. Setting the
+  loader's executable bit counts as a write of `load.sh`.
+- When a file it would write, or a directory above it below the repository root, is a symbolic
+  link, it writes no file and exits with status 1. The error lists every such link, for example
+  `.claude`, `.gitignore` or `.agent-guidance-loader/load.sh`.
+- A link to a file that is already up to date is not written, so a second run works.
+- An `AGENTS.md` that links to `CLAUDE.md`, or a `CLAUDE.md` that links to `AGENTS.md`, is
+  handled as described above: the installer writes the real file.
+- The local exclude file below `.git/` and the repository root itself are not checked.
 
 ## Upgrading the loader
 

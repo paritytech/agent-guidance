@@ -472,6 +472,11 @@ fn keeps_a_claude_md_hard_linked_to_agents_md() {
 	);
 	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n\n# Project\n"));
 	assert_eq!(repo.read("CLAUDE.md"), repo.read("AGENTS.md"));
+	// Both names changed for git, so both are listed for `git add`.
+	let stdout = stdout(&output);
+	assert!(stdout.contains("  AGENTS.md\n"), "{stdout}");
+	assert!(stdout.contains("  CLAUDE.md\n"), "{stdout}");
+	assert!(stdout.contains(" AGENTS.md CLAUDE.md\n"), "{stdout}");
 	repo.assert_second_run_changes_nothing();
 }
 
@@ -482,14 +487,84 @@ fn writes_nothing_through_a_link() {
 	let repo = Repo::new();
 	repo.write("docs/ai.md", "# Claude\n");
 	repo.symlink("docs/ai.md", "CLAUDE.md");
-	assert_refuses_link(&repo, "CLAUDE.md");
+	assert_refuses_links(&repo, &["CLAUDE.md"]);
 
 	// CLAUDE.md links to AGENTS.md, which links elsewhere and would get the fallback.
 	let repo = Repo::new();
 	repo.write("docs/ai.md", "# Project\n");
 	repo.symlink("docs/ai.md", "AGENTS.md");
 	repo.symlink("AGENTS.md", "CLAUDE.md");
-	assert_refuses_link(&repo, "AGENTS.md");
+	assert_refuses_links(&repo, &["AGENTS.md"]);
+}
+
+/// A hook config directory that links elsewhere would have the config written into the target.
+#[test]
+fn writes_nothing_into_a_linked_directory() {
+	let repo = Repo::new();
+	fs::create_dir(repo.root.join("shared")).expect("creating a directory");
+	repo.symlink("shared", ".claude");
+	assert_refuses_links(&repo, &[".claude"]);
+}
+
+#[test]
+fn writes_nothing_through_a_linked_loader() {
+	let repo = Repo::new();
+	repo.write("shared/load.sh", "#!/bin/sh\nold loader\n");
+	fs::create_dir(repo.root.join(".agent-guidance-loader")).expect("creating a directory");
+	repo.symlink("../shared/load.sh", LOADER);
+	assert_refuses_links(&repo, &[LOADER]);
+
+	// Fixing only the mode would change the target too.
+	let repo = Repo::new();
+	repo.write("shared/load.sh", &template(LOADER));
+	fs::create_dir(repo.root.join(".agent-guidance-loader")).expect("creating a directory");
+	repo.symlink("../shared/load.sh", LOADER);
+	assert_refuses_links(&repo, &[LOADER]);
+}
+
+#[test]
+fn writes_nothing_through_a_linked_gitignore() {
+	let repo = Repo::new();
+	repo.write("shared/gitignore", "/target\n");
+	repo.symlink("shared/gitignore", ".gitignore");
+	assert_refuses_links(&repo, &[".gitignore"]);
+}
+
+/// Every link the installer would write through is named in one message.
+#[test]
+fn names_every_link_it_would_write_through() {
+	let repo = Repo::new();
+	fs::create_dir(repo.root.join("shared")).expect("creating a directory");
+	repo.symlink("shared", ".claude");
+	repo.write("shared/gitignore", "/target\n");
+	repo.symlink("shared/gitignore", ".gitignore");
+	repo.write("docs/ai.md", "# Claude\n");
+	repo.symlink("docs/ai.md", "CLAUDE.md");
+	assert_refuses_links(&repo, &[".claude", ".gitignore", "CLAUDE.md"]);
+}
+
+/// Links to files that are already up to date are not written, so a rerun works.
+#[test]
+fn keeps_links_to_up_to_date_files() {
+	let repo = Repo::new();
+	assert!(repo.install().status.success());
+
+	// A linked hook config.
+	fs::rename(
+		repo.root.join(".codex/hooks.json"),
+		repo.root.join("codex-hooks.json"),
+	)
+	.expect("moving the hook config");
+	repo.symlink("../codex-hooks.json", ".codex/hooks.json");
+	// A linked hook config directory.
+	fs::rename(repo.root.join(".claude"), repo.root.join("shared-claude"))
+		.expect("moving the directory");
+	repo.symlink("shared-claude", ".claude");
+	// A linked executable loader.
+	fs::rename(repo.root.join(LOADER), repo.root.join("load.sh")).expect("moving the loader");
+	repo.symlink("../load.sh", LOADER);
+
+	repo.assert_second_run_changes_nothing();
 }
 
 /// An `AGENTS.md` that links to `CLAUDE.md` makes both names one file, so the fallback goes into
@@ -532,19 +607,23 @@ fn writes_through_an_agents_md_that_links_to_claude_md() {
 	}
 }
 
-fn assert_refuses_link(repo: &Repo, link: &str) {
+/// Runs the installer and asserts that it refuses because of `links`, in this order, and changes
+/// no file.
+fn assert_refuses_links(repo: &Repo, links: &[&str]) {
 	let files = repo.snapshot();
 	let output = repo.install();
-	assert_eq!(output.status.code(), Some(1), "{link}");
+	assert_eq!(output.status.code(), Some(1), "{links:?}");
+	let listed: String = links.iter().map(|link| format!("  {link}\n")).collect();
 	assert_eq!(
 		String::from_utf8_lossy(&output.stderr),
 		format!(
-			"error: {link} is a symbolic link, and the installer does not write through links.\n\
-			 No file was changed. Replace {link} with a regular file and run the installer again.\n"
+			"error: the installer does not write through symbolic links, and it would write \
+			 through these:\n{listed}No file was changed. Replace each link with a regular file \
+			 or directory and run the installer again.\n"
 		)
 	);
-	assert_eq!(stdout(&output), "", "{link}");
-	assert_eq!(repo.snapshot(), files, "{link}");
+	assert_eq!(stdout(&output), "", "{links:?}");
+	assert_eq!(repo.snapshot(), files, "{links:?}");
 }
 
 /// A link that the installer does not need to write is fine.

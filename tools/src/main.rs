@@ -349,6 +349,9 @@ fn ignores(text: &str, line: &str) -> bool {
 	})
 }
 
+/// Files to write, relative to the repository root, with their new contents.
+type Plan = Vec<(&'static str, String)>;
+
 /// Writes files below the repository root and records which ones changed.
 struct Installer {
 	root: PathBuf,
@@ -421,24 +424,15 @@ impl Installer {
 		let text = String::from_utf8(output.stdout).ok()?;
 		Some(text.strip_suffix('\n').unwrap_or(&text).to_owned())
 	}
+}
 
-	/// Appends `line` to `path`, creating the file when it is missing.
-	///
-	/// A non-empty file is first terminated with a newline.
-	fn append(
-		&mut self,
-		path: &'static str,
-		existing: Option<&str>,
-		line: &str,
-	) -> Result<(), String> {
-		let mut text = existing.unwrap_or_default().to_owned();
-		if !text.is_empty() && !text.ends_with('\n') {
-			text.push('\n');
-		}
-		text.push_str(line);
+/// Appends `line` to the file contents `text`, first terminating non-empty text with a newline.
+fn append_line(text: &mut String, line: &str) {
+	if !text.is_empty() && !text.ends_with('\n') {
 		text.push('\n');
-		self.write(path, &text)
 	}
+	text.push_str(line);
+	text.push('\n');
 }
 
 fn main() -> ExitCode {
@@ -565,30 +559,101 @@ fn main() -> ExitCode {
 			.filter_map(|(path, text)| Some((path, text?)))
 			.collect()
 	};
-	// A write through a link would change the link's target, which can be any file, or create it.
-	for (path, _) in &writes {
-		let link = fs::symlink_metadata(installer.root.join(path))
-			.is_ok_and(|metadata| metadata.file_type().is_symlink());
-		if link {
-			eprintln!(
-				"error: {path} is a symbolic link, and the installer does not write through \
-				 links.\nNo file was changed. Replace {path} with a regular file and run the \
-				 installer again."
-			);
+	// A CLAUDE.md hard-linked to AGENTS.md changes with it, and git sees both names change.
+	let symlink = |path| {
+		fs::symlink_metadata(installer.root.join(path))
+			.is_ok_and(|metadata| metadata.file_type().is_symlink())
+	};
+	let hard_linked = linked && !symlink("AGENTS.md") && !symlink("CLAUDE.md");
+
+	// Every file the installer writes is planned first, so that a refusal changes nothing.
+	let planned = (|| -> Result<(Plan, Vec<String>), String> {
+		let mut plan = vec![(LOADER_PATH, LOADER.to_owned())];
+		// Hook configs that cannot be merged are left unchanged and reported.
+		let mut merge_errors = Vec::new();
+		for (path, template, event) in HOOK_CONFIGS {
+			let Some(existing) = installer.read(path)? else {
+				plan.push((path, template.to_owned()));
+				continue;
+			};
+			match merge_hook(&existing, template, event) {
+				Ok(Some(merged)) => plan.push((path, merged)),
+				Ok(None) => {}
+				Err(e) => merge_errors.push(format!(
+					"error: {path}: {e}\n\
+					 The file was left unchanged. Add or update its loader hook by hand to \
+					 match:\n{template}"
+				)),
+			}
+		}
+		plan.push((COPILOT_CONFIG.0, COPILOT_CONFIG.1.to_owned()));
+		let gitignore = installer.read(".gitignore")?;
+		let mut text = gitignore.clone().unwrap_or_default();
+		for line in GITIGNORE_LINES {
+			if !ignores(&text, line) {
+				append_line(&mut text, line);
+			}
+		}
+		if gitignore.as_deref() != Some(text.as_str()) {
+			plan.push((".gitignore", text));
+		}
+		plan.extend(writes);
+		// A file that already holds the planned bytes is not written.
+		plan.retain(|(path, contents)| {
+			!fs::read(installer.root.join(path)).is_ok_and(|old| old == contents.as_bytes())
+		});
+		Ok((plan, merge_errors))
+	})();
+	let (plan, merge_errors) = match planned {
+		Ok(planned) => planned,
+		Err(e) => {
+			eprintln!("error: {e}");
 			return ExitCode::FAILURE;
 		}
+	};
+	// git records only the executable bit, so a checkout may have 775 or 755 depending on the
+	// umask. Only a missing executable bit is a change, and setting the mode writes the file too.
+	let loader_mode =
+		fs::metadata(&loader).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0o111);
+
+	// A write through a link would change the link's target, which can be any file, or create it.
+	// The path and every directory above it below the root count.
+	let mut links: Vec<&str> = Vec::new();
+	let mut written: Vec<&str> = plan.iter().map(|(path, _)| *path).collect();
+	if loader_mode && !written.contains(&LOADER_PATH) {
+		written.push(LOADER_PATH);
 	}
-	let mut failed = false;
+	for path in written {
+		for part in ancestors(path).into_iter().chain([path]) {
+			if symlink(part) && !links.contains(&part) {
+				links.push(part);
+			}
+		}
+	}
+	if !links.is_empty() {
+		let listed: String = links.iter().map(|link| format!("  {link}\n")).collect();
+		eprintln!(
+			"error: the installer does not write through symbolic links, and it would write \
+			 through these:\n{listed}No file was changed. Replace each link with a regular file \
+			 or directory and run the installer again."
+		);
+		return ExitCode::FAILURE;
+	}
+
+	for e in &merge_errors {
+		eprintln!("{e}");
+	}
+	let failed = !merge_errors.is_empty();
 	// The local exclude file, when this run changed it and so made git track a hook config that
 	// it ignored. The file is not committed.
 	let mut reincluded = None;
 	let result = (|| -> Result<(), String> {
-		installer.write(LOADER_PATH, LOADER)?;
+		for (path, contents) in &plan {
+			installer.write(path, contents)?;
+		}
 		let mut permissions = fs::metadata(&loader)
 			.map_err(|e| format!("reading {LOADER_PATH}: {e}"))?
 			.permissions();
-		// git records only the executable bit, so a checkout may have 775 or 755 depending on
-		// the umask. Only a missing executable bit is a change.
 		if permissions.mode() & 0o111 != 0o111 {
 			permissions.set_mode(0o755);
 			fs::set_permissions(&loader, permissions)
@@ -597,32 +662,11 @@ fn main() -> ExitCode {
 				installer.changed.push(LOADER_PATH);
 			}
 		}
-
-		for (path, template, event) in HOOK_CONFIGS {
-			let Some(existing) = installer.read(path)? else {
-				installer.write(path, template)?;
-				continue;
-			};
-			match merge_hook(&existing, template, event) {
-				Ok(Some(merged)) => installer.write(path, &merged)?,
-				Ok(None) => {}
-				Err(e) => {
-					eprintln!(
-						"error: {path}: {e}\n\
-						 The file was left unchanged. Add or update its loader hook by hand to \
-						 match:\n{template}"
-					);
-					failed = true;
-				}
-			}
-		}
-		installer.write(COPILOT_CONFIG.0, COPILOT_CONFIG.1)?;
-
-		for line in GITIGNORE_LINES {
-			let gitignore = installer.read(".gitignore")?;
-			if !gitignore.as_deref().is_some_and(|text| ignores(text, line)) {
-				installer.append(".gitignore", gitignore.as_deref(), line)?;
-			}
+		if hard_linked
+			&& installer.changed.contains(&"AGENTS.md")
+			&& !installer.changed.contains(&"CLAUDE.md")
+		{
+			installer.changed.push("CLAUDE.md");
 		}
 
 		// A global excludes file that ignores `.claude/` or `.codex/` would keep a hook config
@@ -671,10 +715,6 @@ fn main() -> ExitCode {
 					reincluded = Some(exclude);
 				}
 			}
-		}
-
-		for (path, text) in &writes {
-			installer.write(path, text)?;
 		}
 		Ok(())
 	})();
