@@ -3,16 +3,21 @@
 //! Usage: `agent-guidance-install [ROOT]`, where ROOT is the repository root and defaults to the
 //! top level of the git repository that contains the current directory. The installer writes
 //! `.agent-guidance-loader/load.sh`, adds a SessionStart hook that runs it to the config of each
-//! supported harness, ignores the `.agent-guidance/` cache and the loader's temporary clones, and
-//! adds a fallback line to `AGENTS.md` and `CLAUDE.md`. Running it again changes nothing unless
-//! the templates changed. It never commits; it prints the files to review and add.
+//! supported harness, ignores the `.agent-guidance/` cache and the loader's temporary clones,
+//! re-includes hook configs that git ignores in the local exclude file, puts a fallback paragraph
+//! at the top of `AGENTS.md`, and makes `CLAUDE.md` import `AGENTS.md`.
+//! Running it again changes nothing unless the templates changed. It never commits; it prints the
+//! files to review and add.
 
 use serde_json::{Map, Value};
 use std::{
 	ffi::OsStr,
 	fs, io,
-	os::unix::{ffi::OsStrExt, fs::PermissionsExt},
-	path::PathBuf,
+	os::unix::{
+		ffi::OsStrExt,
+		fs::{MetadataExt, PermissionsExt},
+	},
+	path::{Path, PathBuf},
 	process::{Command, ExitCode, Stdio},
 };
 
@@ -57,14 +62,72 @@ const COPILOT_CONFIG: (&str, &str) = (
 	include_str!("../templates/.github/hooks/agent-guidance.json"),
 );
 
-/// Paragraph added to `AGENTS.md` and `CLAUDE.md` for sessions where no hook delivers the
-/// guidance.
+/// Paragraph put at the top of `AGENTS.md` for sessions where no hook delivers the guidance.
 ///
-/// It is wrapped at 80 columns. A file that already mentions `agent-guidance`, including one
-/// holding the earlier single-line version of this paragraph, is left unchanged.
+/// `CLAUDE.md` gets it through [`CLAUDE_IMPORT`]. It is wrapped at 80 columns. A file that
+/// already mentions `agent-guidance`, including one holding an earlier version of this paragraph
+/// at its end, is left unchanged.
 const FALLBACK: &str = "Company agent guidance lives in `.agent-guidance/GUIDANCE.md`. If that\n\
 	directory is missing, clone https://github.com/paritytech/agent-guidance into\n\
 	`.agent-guidance/` and read it.";
+
+/// Contents of a `CLAUDE.md` written by the installer: Claude Code imports `AGENTS.md` from it.
+const CLAUDE_IMPORT: &str = "@AGENTS.md\n";
+
+/// Returns `text` with [`FALLBACK`] as its first paragraph.
+///
+/// Text that already mentions `agent-guidance` is returned unchanged, and text with nothing but
+/// whitespace is replaced. Otherwise the existing bytes follow the paragraph and a blank line.
+fn prepend_fallback(text: &str) -> String {
+	if text.contains("agent-guidance") {
+		text.to_owned()
+	} else if text.trim().is_empty() {
+		format!("{FALLBACK}\n")
+	} else {
+		format!("{FALLBACK}\n\n{text}")
+	}
+}
+
+/// Computes new contents for `AGENTS.md` and `CLAUDE.md` from their current contents, `None`
+/// meaning a missing file.
+///
+/// [`FALLBACK`] goes at the top of `AGENTS.md` (see [`prepend_fallback`]), and `CLAUDE.md`
+/// imports `AGENTS.md` with the line [`CLAUDE_IMPORT`].
+///
+/// - A `CLAUDE.md` that contains `@AGENTS.md` or `@./AGENTS.md` is kept, also when `AGENTS.md` is
+///   missing.
+/// - Otherwise, when `AGENTS.md` is missing or holds only whitespace, the content of `CLAUDE.md`
+///   moves into it.
+/// - A missing or empty `CLAUDE.md` is replaced with the import.
+/// - When `CLAUDE.md` does not import `AGENTS.md` but either file mentions `agent-guidance`, the
+///   repository holds an earlier install and both files are kept.
+///
+/// Returns the new contents of (`AGENTS.md`, `CLAUDE.md`), `None` where a file stays as it is.
+/// An error means that both files hold their own instructions; merging them is left to the
+/// maintainer.
+fn instruction_files(
+	agents: Option<&str>,
+	claude: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+	let new_agents = |text: &str| {
+		let new = prepend_fallback(text);
+		(agents != Some(new.as_str())).then_some(new)
+	};
+	let import = Some(CLAUDE_IMPORT.to_owned());
+	let Some(claude) = claude.filter(|text| !text.trim().is_empty()) else {
+		return Ok((new_agents(agents.unwrap_or_default()), import));
+	};
+	if claude.contains("@AGENTS.md") || claude.contains("@./AGENTS.md") {
+		return Ok((new_agents(agents.unwrap_or_default()), None));
+	}
+	let Some(agents) = agents.filter(|text| !text.trim().is_empty()) else {
+		return Ok((new_agents(claude), import));
+	};
+	if agents.contains("agent-guidance") || claude.contains("agent-guidance") {
+		return Ok((None, None));
+	}
+	Err("AGENTS.md and CLAUDE.md both exist and CLAUDE.md does not import AGENTS.md.".into())
+}
 
 /// Lines added to `.gitignore`: the cache and the loader's temporary clones.
 const GITIGNORE_LINES: [&str; 2] = ["/.agent-guidance/", "/.agent-guidance.tmp.*/"];
@@ -210,6 +273,69 @@ fn merge_hook(existing: &str, template: &str, event: &str) -> Result<Option<Stri
 	Ok(Some(text))
 }
 
+/// Paths of all hook configs the installer writes.
+const HOOK_CONFIG_PATHS: [&str; 5] = [
+	HOOK_CONFIGS[0].0,
+	HOOK_CONFIGS[1].0,
+	HOOK_CONFIGS[2].0,
+	HOOK_CONFIGS[3].0,
+	COPILOT_CONFIG.0,
+];
+
+/// Directories that contain `path`, from the top down: `.github` and then `.github/hooks` for
+/// `.github/hooks/agent-guidance.json`.
+fn ancestors(path: &str) -> Vec<&str> {
+	let mut dirs: Vec<&str> = Path::new(path)
+		.ancestors()
+		.skip(1)
+		.filter_map(Path::to_str)
+		.filter(|dir| !dir.is_empty())
+		.collect();
+	dirs.reverse();
+	dirs
+}
+
+/// Exclude lines that make git track the hook config `path` that it ignores.
+///
+/// Git cannot re-include a file whose directory is excluded. So each ignored directory above
+/// the file (`ignored_dirs`, from the top down) is re-included and everything else in it, for
+/// example `.codex/worktrees/`, ignored again before the file is re-included.
+fn reinclude_lines(path: &str, ignored_dirs: &[&str]) -> Vec<String> {
+	let mut lines = Vec::new();
+	for dir in ignored_dirs {
+		lines.push(format!("!/{dir}/"));
+		lines.push(format!("/{dir}/*"));
+	}
+	lines.push(format!("!/{path}"));
+	lines
+}
+
+/// Appends each group of lines to the exclude file contents `text` unless the whole group is
+/// already there as consecutive lines in the same order. Returns `None` when nothing is added.
+///
+/// The last matching pattern wins, so a group whose lines are present but out of order may
+/// not re-include its file and is added again as a whole.
+fn add_exclude_groups(text: &str, groups: &[Vec<String>]) -> Option<String> {
+	let mut new = text.to_owned();
+	for group in groups {
+		let lines: Vec<&str> = new.lines().map(str::trim_end).collect();
+		if lines
+			.windows(group.len())
+			.any(|window| window == group.as_slice())
+		{
+			continue;
+		}
+		if !new.is_empty() && !new.ends_with('\n') {
+			new.push('\n');
+		}
+		for line in group {
+			new.push_str(line);
+			new.push('\n');
+		}
+	}
+	(new != text).then_some(new)
+}
+
 /// Whether the `.gitignore` contents `text` already hold `line` or an equivalent line.
 ///
 /// A line counts as present with or without the leading and trailing slash. Git ignores trailing
@@ -222,6 +348,9 @@ fn ignores(text: &str, line: &str) -> bool {
 		existing.strip_suffix('/').unwrap_or(existing) == pattern
 	})
 }
+
+/// Files to write, relative to the repository root, with their new contents.
+type Plan = Vec<(&'static str, String)>;
 
 /// Writes files below the repository root and records which ones changed.
 struct Installer {
@@ -257,30 +386,53 @@ impl Installer {
 		Ok(())
 	}
 
-	/// Appends `line` to `path`, creating the file when it is missing.
+	/// Returns the paths among `paths` that git ignores, as `git check-ignore` prints them.
 	///
-	/// A non-empty file is first terminated with a newline. With `paragraph` set, a blank line
-	/// separates the new line from the existing text.
-	fn append(
-		&mut self,
-		path: &'static str,
-		existing: Option<&str>,
-		line: &str,
-		paragraph: bool,
-	) -> Result<(), String> {
-		let mut text = existing.unwrap_or_default().to_owned();
-		if !text.is_empty() {
-			if !text.ends_with('\n') {
-				text.push('\n');
-			}
-			if paragraph && !text.ends_with("\n\n") {
-				text.push('\n');
-			}
-		}
-		text.push_str(line);
-		text.push('\n');
-		self.write(path, &text)
+	/// Outside a git repository the check fails and nothing is returned.
+	fn ignored(&self, paths: &[&str]) -> Vec<String> {
+		Command::new("git")
+			.arg("-C")
+			.arg(&self.root)
+			.args(["check-ignore", "--"])
+			.args(paths)
+			.stdin(Stdio::null())
+			.output()
+			.map(|output| {
+				String::from_utf8_lossy(&output.stdout)
+					.lines()
+					.map(str::to_owned)
+					.collect()
+			})
+			.unwrap_or_default()
 	}
+
+	/// Runs git with `args` in `root` and returns its output without the final line break, or
+	/// `None` when git fails, for example outside a git repository.
+	///
+	/// A path that `rev-parse --git-path` prints is relative to `root` unless it is absolute, as
+	/// in a linked worktree.
+	fn git(&self, args: &[&str]) -> Option<String> {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(&self.root)
+			.args(args)
+			.stdin(Stdio::null())
+			.stderr(Stdio::null())
+			.output()
+			.ok()
+			.filter(|output| output.status.success())?;
+		let text = String::from_utf8(output.stdout).ok()?;
+		Some(text.strip_suffix('\n').unwrap_or(&text).to_owned())
+	}
+}
+
+/// Appends `line` to the file contents `text`, first terminating non-empty text with a newline.
+fn append_line(text: &mut String, line: &str) {
+	if !text.is_empty() && !text.ends_with('\n') {
+		text.push('\n');
+	}
+	text.push_str(line);
+	text.push('\n');
 }
 
 fn main() -> ExitCode {
@@ -356,14 +508,152 @@ fn main() -> ExitCode {
 		root,
 		changed: Vec::new(),
 	};
-	let mut failed = false;
+	// A refusal to merge AGENTS.md and CLAUDE.md, like a downgrade, leaves every file unchanged.
+	// When one name links to the other, including a dangling link, or both are hard links to one
+	// file, CLAUDE.md acts as an import and is never written; only AGENTS.md gets the fallback.
+	let file_id = |path| {
+		fs::metadata(installer.root.join(path))
+			.ok()
+			.map(|metadata| (metadata.dev(), metadata.ino()))
+	};
+	let links_to = |link, target: &str| {
+		fs::read_link(installer.root.join(link))
+			.is_ok_and(|to| to == Path::new(target) || to == Path::new(".").join(target))
+	};
+	let agents_links_to_claude = links_to("AGENTS.md", "CLAUDE.md");
+	let linked = agents_links_to_claude
+		|| links_to("CLAUDE.md", "AGENTS.md")
+		|| file_id("AGENTS.md").is_some_and(|agents| file_id("CLAUDE.md") == Some(agents));
+	let instructions = installer.read("AGENTS.md").and_then(|agents| {
+		let claude = if linked {
+			Some(CLAUDE_IMPORT.to_owned())
+		} else {
+			installer.read("CLAUDE.md")?
+		};
+		Ok(instruction_files(agents.as_deref(), claude.as_deref()))
+	});
+	let (agents_md, claude_md) = match instructions {
+		Ok(Ok(contents)) => contents,
+		Ok(Err(e)) => {
+			eprintln!(
+				"error: {e}\nNo file was changed. Merge CLAUDE.md into AGENTS.md, replace \
+				 CLAUDE.md with the line @AGENTS.md, and run the installer again."
+			);
+			return ExitCode::FAILURE;
+		}
+		Err(e) => {
+			eprintln!("error: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	// The new AGENTS.md of an AGENTS.md that links to CLAUDE.md goes into CLAUDE.md, so that the
+	// real file is written and listed. CLAUDE.md has no contents of its own then.
+	let writes: Vec<(&'static str, String)> = if agents_links_to_claude {
+		agents_md
+			.map(|text| ("CLAUDE.md", text))
+			.into_iter()
+			.collect()
+	} else {
+		[("AGENTS.md", agents_md), ("CLAUDE.md", claude_md)]
+			.into_iter()
+			.filter_map(|(path, text)| Some((path, text?)))
+			.collect()
+	};
+	// A CLAUDE.md hard-linked to AGENTS.md changes with it, and git sees both names change.
+	let symlink = |path| {
+		fs::symlink_metadata(installer.root.join(path))
+			.is_ok_and(|metadata| metadata.file_type().is_symlink())
+	};
+	let hard_linked = linked && !symlink("AGENTS.md") && !symlink("CLAUDE.md");
+
+	// Every file the installer writes is planned first, so that a refusal changes nothing.
+	let planned = (|| -> Result<(Plan, Vec<String>), String> {
+		let mut plan = vec![(LOADER_PATH, LOADER.to_owned())];
+		// Hook configs that cannot be merged are left unchanged and reported.
+		let mut merge_errors = Vec::new();
+		for (path, template, event) in HOOK_CONFIGS {
+			let Some(existing) = installer.read(path)? else {
+				plan.push((path, template.to_owned()));
+				continue;
+			};
+			match merge_hook(&existing, template, event) {
+				Ok(Some(merged)) => plan.push((path, merged)),
+				Ok(None) => {}
+				Err(e) => merge_errors.push(format!(
+					"error: {path}: {e}\n\
+					 The file was left unchanged. Add or update its loader hook by hand to \
+					 match:\n{template}"
+				)),
+			}
+		}
+		plan.push((COPILOT_CONFIG.0, COPILOT_CONFIG.1.to_owned()));
+		let gitignore = installer.read(".gitignore")?;
+		let mut text = gitignore.clone().unwrap_or_default();
+		for line in GITIGNORE_LINES {
+			if !ignores(&text, line) {
+				append_line(&mut text, line);
+			}
+		}
+		if gitignore.as_deref() != Some(text.as_str()) {
+			plan.push((".gitignore", text));
+		}
+		plan.extend(writes);
+		// A file that already holds the planned bytes is not written.
+		plan.retain(|(path, contents)| {
+			!fs::read(installer.root.join(path)).is_ok_and(|old| old == contents.as_bytes())
+		});
+		Ok((plan, merge_errors))
+	})();
+	let (plan, merge_errors) = match planned {
+		Ok(planned) => planned,
+		Err(e) => {
+			eprintln!("error: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	// git records only the executable bit, so a checkout may have 775 or 755 depending on the
+	// umask. Only a missing executable bit is a change, and setting the mode writes the file too.
+	let loader_mode =
+		fs::metadata(&loader).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0o111);
+
+	// A write through a link would change the link's target, which can be any file, or create it.
+	// The path and every directory above it below the root count.
+	let mut links: Vec<&str> = Vec::new();
+	let mut written: Vec<&str> = plan.iter().map(|(path, _)| *path).collect();
+	if loader_mode && !written.contains(&LOADER_PATH) {
+		written.push(LOADER_PATH);
+	}
+	for path in written {
+		for part in ancestors(path).into_iter().chain([path]) {
+			if symlink(part) && !links.contains(&part) {
+				links.push(part);
+			}
+		}
+	}
+	if !links.is_empty() {
+		let listed: String = links.iter().map(|link| format!("  {link}\n")).collect();
+		eprintln!(
+			"error: the installer does not write through symbolic links, and it would write \
+			 through these:\n{listed}No file was changed. Replace each link with a regular file \
+			 or directory and run the installer again."
+		);
+		return ExitCode::FAILURE;
+	}
+
+	for e in &merge_errors {
+		eprintln!("{e}");
+	}
+	let failed = !merge_errors.is_empty();
+	// The local exclude file, when this run changed it and so made git track a hook config that
+	// it ignored. The file is not committed.
+	let mut reincluded = None;
 	let result = (|| -> Result<(), String> {
-		installer.write(LOADER_PATH, LOADER)?;
+		for (path, contents) in &plan {
+			installer.write(path, contents)?;
+		}
 		let mut permissions = fs::metadata(&loader)
 			.map_err(|e| format!("reading {LOADER_PATH}: {e}"))?
 			.permissions();
-		// git records only the executable bit, so a checkout may have 775 or 755 depending on
-		// the umask. Only a missing executable bit is a change.
 		if permissions.mode() & 0o111 != 0o111 {
 			permissions.set_mode(0o755);
 			fs::set_permissions(&loader, permissions)
@@ -372,42 +662,58 @@ fn main() -> ExitCode {
 				installer.changed.push(LOADER_PATH);
 			}
 		}
+		if hard_linked
+			&& installer.changed.contains(&"AGENTS.md")
+			&& !installer.changed.contains(&"CLAUDE.md")
+		{
+			installer.changed.push("CLAUDE.md");
+		}
 
-		for (path, template, event) in HOOK_CONFIGS {
-			let Some(existing) = installer.read(path)? else {
-				installer.write(path, template)?;
-				continue;
+		// A global excludes file that ignores `.claude/` or `.codex/` would keep a hook config
+		// out of a plain `git add`. The lines that re-include it go to the local exclude file:
+		// the shared `.gitignore` must not encode one person's global excludes. The exclude file
+		// takes precedence over `core.excludesFile` but not over a tracked `.gitignore`, so a
+		// rule of the repository itself still wins and the warning below still shows. The lines
+		// are anchored at the top level, so below it the step is skipped and only the warning
+		// shows.
+		let at_top_level = installer
+			.git(&["rev-parse", "--show-prefix"])
+			.is_some_and(|prefix| prefix.is_empty());
+		let ignored_hooks = installer.ignored(&HOOK_CONFIG_PATHS);
+		let groups: Vec<Vec<String>> = ignored_hooks
+			.iter()
+			.map(|path| {
+				let dirs: Vec<&str> = ancestors(path)
+					.into_iter()
+					.filter(|dir| !installer.ignored(&[&format!("{dir}/")]).is_empty())
+					.collect();
+				reinclude_lines(path, &dirs)
+			})
+			.collect();
+		if let Some(exclude) = installer
+			.git(&["rev-parse", "--git-path", "info/exclude"])
+			.filter(|exclude| at_top_level && !groups.is_empty() && !exclude.is_empty())
+		{
+			let full = installer.root.join(&exclude);
+			let text = match fs::read_to_string(&full) {
+				Ok(text) => text,
+				Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+				Err(e) => return Err(format!("reading {exclude}: {e}")),
 			};
-			match merge_hook(&existing, template, event) {
-				Ok(Some(merged)) => installer.write(path, &merged)?,
-				Ok(None) => {}
-				Err(e) => {
-					eprintln!(
-						"error: {path}: {e}\n\
-						 The file was left unchanged. Add or update its loader hook by hand to \
-						 match:\n{template}"
-					);
-					failed = true;
+			if let Some(new) = add_exclude_groups(&text, &groups) {
+				if let Some(parent) = full.parent() {
+					fs::create_dir_all(parent)
+						.map_err(|e| format!("creating {}: {e}", parent.display()))?;
 				}
-			}
-		}
-		installer.write(COPILOT_CONFIG.0, COPILOT_CONFIG.1)?;
-
-		for line in GITIGNORE_LINES {
-			let gitignore = installer.read(".gitignore")?;
-			if !gitignore.as_deref().is_some_and(|text| ignores(text, line)) {
-				installer.append(".gitignore", gitignore.as_deref(), line, false)?;
-			}
-		}
-
-		for path in ["AGENTS.md", "CLAUDE.md"] {
-			let existing = installer.read(path)?;
-			let skip = existing.as_deref().is_some_and(|text| {
-				text.contains("agent-guidance")
-					|| (path == "CLAUDE.md" && text.contains("@AGENTS.md"))
-			});
-			if !skip {
-				installer.append(path, existing.as_deref(), FALLBACK, true)?;
+				fs::write(&full, new).map_err(|e| format!("writing {exclude}: {e}"))?;
+				// The lines may not help, for example against the repository's `.gitignore`.
+				let still_ignored = installer.ignored(&HOOK_CONFIG_PATHS);
+				if ignored_hooks
+					.iter()
+					.any(|path| !still_ignored.contains(path))
+				{
+					reincluded = Some(exclude);
+				}
 			}
 		}
 		Ok(())
@@ -417,8 +723,8 @@ fn main() -> ExitCode {
 		return ExitCode::FAILURE;
 	}
 
-	// An installed file that git ignores, for example through a local `.codex/` exclude, is
-	// missed by a plain `git add`. Outside a git repository the check fails and is skipped.
+	// An installed file that git still ignores, for example through a `.gitignore` in its
+	// directory, is missed by a plain `git add`.
 	let installed = [
 		LOADER_PATH,
 		HOOK_CONFIGS[0].0,
@@ -430,27 +736,22 @@ fn main() -> ExitCode {
 		"AGENTS.md",
 		"CLAUDE.md",
 	];
-	let ignored: Vec<String> = Command::new("git")
-		.arg("-C")
-		.arg(&installer.root)
-		.args(["check-ignore", "--"])
-		.args(installed)
-		.output()
-		.map(|output| {
-			String::from_utf8_lossy(&output.stdout)
-				.lines()
-				.map(str::to_owned)
-				.collect()
-		})
-		.unwrap_or_default();
+	let ignored = installer.ignored(&installed);
 	for path in &ignored {
 		eprintln!("warning: git ignores {path}; add it with `git add -f {path}`");
 	}
 
 	println!("{loader_report}");
-	if installer.changed.is_empty() {
+	if installer.changed.is_empty() && reincluded.is_none() {
 		println!("Nothing to change.");
-	} else {
+	}
+	if let Some(exclude) = &reincluded {
+		println!(
+			"Re-included ignored hook configs in {exclude}, which is local to this clone and \
+			 not committed."
+		);
+	}
+	if !installer.changed.is_empty() {
 		println!("Changed files:");
 		for path in &installer.changed {
 			println!("  {path}");

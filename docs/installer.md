@@ -40,10 +40,60 @@ repository, and leaves committing to the maintainer.
 - It always writes `.github/hooks/agent-guidance.json` from the template.
 - It adds `/.agent-guidance/` and `/.agent-guidance.tmp.*/` to `.gitignore` unless equivalent lines
   exist.
-- It adds the fallback line to `AGENTS.md` and `CLAUDE.md` unless they already mention
-  `agent-guidance`.
-  - `CLAUDE.md` is left alone when it imports `@AGENTS.md`.
+- When git ignores a hook config, for example through a global excludes file with `.claude/` or
+  `.codex/`, it adds lines that make git track the config to the clone's local exclude file
+  (`.git/info/exclude`, as `git rev-parse --git-path info/exclude` finds it).
+  - The shared `.gitignore` is not changed, since it must not encode one person's global
+    excludes. The exclude file is not committed and is not listed in the `git add` command.
+  - Git cannot re-include a file in an excluded directory. For each ignored directory above the
+    file, from the top down, it adds two lines that re-include the directory and ignore
+    everything else in it, such as `!/.claude/` and `/.claude/*`. The file line, such as
+    `!/.claude/settings.json`, comes last. Other files, such as `.codex/worktrees/`, stay
+    ignored.
+  - When only the file is ignored, it adds just the file line.
+  - The lines come after existing ones, so they win over an earlier `/.codex/` line in the
+    exclude file.
+  - A group of lines is added again unless it already appears as a whole, in the same order.
+  - The exclude file takes precedence over `core.excludesFile` but not over a tracked
+    `.gitignore`. When the repository's own `.gitignore` ignores a hook config, that rule wins
+    and the warning below shows.
+  - The lines are anchored at the top level. When ROOT is a directory below it, the installer
+    leaves the exclude file alone, and the warning below shows.
+- It puts the fallback line at the top of `AGENTS.md`, followed by a blank line and the existing
+  text, unless the file already mentions `agent-guidance`.
   - The line is quoted in the [README](../README.md#installing-in-a-repository).
+- It makes `CLAUDE.md` import `AGENTS.md` with the line `@AGENTS.md`.
+  - A missing or empty `CLAUDE.md` is written with that line alone.
+  - A `CLAUDE.md` that contains `@AGENTS.md` or `@./AGENTS.md`, is a symbolic link to
+    `AGENTS.md` or `./AGENTS.md`, or is a hard link to `AGENTS.md`, is left alone, also when
+    `AGENTS.md` is missing. A hard-linked `CLAUDE.md` changes with `AGENTS.md`, so both are
+    listed as changed.
+  - When `AGENTS.md` is missing or empty, the content of any other `CLAUDE.md` moves to
+    `AGENTS.md` below the fallback line, and `CLAUDE.md` is replaced with the import.
+  - When `CLAUDE.md` does not import `AGENTS.md` but either file mentions `agent-guidance`, both
+    files are left alone. Earlier installers added the fallback line to both files.
+  - When both files hold other instructions and `CLAUDE.md` does not import `AGENTS.md`, the
+    installer checks this before it writes anything, writes no file, and exits with status 1.
+    Merge `CLAUDE.md` into `AGENTS.md`, replace `CLAUDE.md` with the line `@AGENTS.md`, and run
+    the installer again.
+  - An `AGENTS.md` that is a symbolic link to `CLAUDE.md` makes both names one file. The
+    fallback line is written to `CLAUDE.md`, which is created when it is missing, and listed as
+    the changed file.
+
+## Symbolic links
+
+The installer plans every write before it writes anything, and never writes through a symbolic
+link.
+
+- A file counts as written when its planned contents differ from what is on disk. Setting the
+  loader's executable bit counts as a write of `load.sh`.
+- When a file it would write, or a directory above it below the repository root, is a symbolic
+  link, it writes no file and exits with status 1. The error lists every such link, for example
+  `.claude`, `.gitignore` or `.agent-guidance-loader/load.sh`.
+- A link to a file that is already up to date is not written, so a second run works.
+- An `AGENTS.md` that links to `CLAUDE.md`, or a `CLAUDE.md` that links to `AGENTS.md`, is
+  handled as described above: the installer writes the real file.
+- The local exclude file below `.git/` and the repository root itself are not checked.
 
 ## Upgrading the loader
 
@@ -77,9 +127,11 @@ Commit the changed files it lists. The first line of its output reports the load
 - It never commits.
 - It reports the loader version, then lists the changed files and the `git add` command to run.
 - A second run changes nothing.
-- It warns when git ignores one of the files it wrote. Add such a file with `git add -f`.
-  - A local `.codex/` exclude can cause this.
-  - A global gitignore that ignores `.claude/` or `.codex/` triggers the same warning.
+- It warns when git still ignores one of the files it wrote. Add such a file with `git add -f`.
+  - A tracked `.gitignore` that ignores the file can cause this, since it takes precedence over
+    the lines added to the exclude file.
+- It reports when lines it added to the local exclude file made git track a hook config. That
+  file is not committed.
 
 ## Publishing
 

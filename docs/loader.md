@@ -62,7 +62,7 @@ Git never prompts: the loader sets `GIT_TERMINAL_PROMPT=0` and runs SSH in batch
 - With a cache, the context is one header line with the absolute cache path, followed by
   `GUIDANCE.md`.
 - Without a cache (the first session offline), the context is one line that points the agent to
-  the fallback line in `AGENTS.md` and `CLAUDE.md`.
+  the fallback line in `AGENTS.md`, which `CLAUDE.md` imports.
 - The loader prints one JSON object on stdout in the shape the harness reads. See
   [output shapes](harnesses.md#output-shapes).
 - For Claude Code, Codex and Gemini CLI the object also carries a status line for the user. See

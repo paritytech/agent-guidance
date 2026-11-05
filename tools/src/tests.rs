@@ -122,6 +122,255 @@ fn fallback_is_wrapped_at_80_columns() {
 	assert!(FALLBACK.contains("agent-guidance"));
 }
 
+#[test]
+fn lists_ancestors_from_the_top_down() {
+	assert_eq!(
+		ancestors(".github/hooks/agent-guidance.json"),
+		[".github", ".github/hooks"]
+	);
+	assert_eq!(ancestors(".claude/settings.json"), [".claude"]);
+	assert!(ancestors("AGENTS.md").is_empty());
+}
+
+#[test]
+fn reincludes_an_ignored_file_and_its_ignored_directories() {
+	assert_eq!(
+		reinclude_lines(".claude/settings.json", &[".claude"]),
+		["!/.claude/", "/.claude/*", "!/.claude/settings.json"]
+	);
+	assert_eq!(
+		reinclude_lines(
+			".github/hooks/agent-guidance.json",
+			&[".github", ".github/hooks"]
+		),
+		[
+			"!/.github/",
+			"/.github/*",
+			"!/.github/hooks/",
+			"/.github/hooks/*",
+			"!/.github/hooks/agent-guidance.json"
+		]
+	);
+	assert_eq!(
+		reinclude_lines(".codex/hooks.json", &[]),
+		["!/.codex/hooks.json"]
+	);
+}
+
+#[test]
+fn adds_an_exclude_group_unless_it_is_there_in_order() {
+	let group = reinclude_lines(".codex/hooks.json", &[".codex"]);
+	let groups = [group.clone()];
+	let block = format!("{}\n", group.join("\n"));
+
+	assert_eq!(add_exclude_groups("", &groups), Some(block.clone()));
+	assert_eq!(
+		add_exclude_groups("/.codex/", &groups),
+		Some(format!("/.codex/\n{block}"))
+	);
+	assert_eq!(add_exclude_groups(&block, &groups), None);
+	assert_eq!(
+		add_exclude_groups(&format!("# local\n{block}/target/\n"), &groups),
+		None
+	);
+
+	// The same lines out of order or apart do not count.
+	let reordered = "!/.codex/hooks.json\n!/.codex/\n/.codex/*\n";
+	assert_eq!(
+		add_exclude_groups(reordered, &groups),
+		Some(format!("{reordered}{block}"))
+	);
+	let apart = "!/.codex/\n/.codex/*\n/.codex/x\n!/.codex/hooks.json\n";
+	assert_eq!(
+		add_exclude_groups(apart, &groups),
+		Some(format!("{apart}{block}"))
+	);
+}
+
+/// `FALLBACK` followed by a blank line and `text`.
+fn with_fallback(text: &str) -> String {
+	format!("{FALLBACK}\n\n{text}")
+}
+
+#[test]
+fn creates_both_instruction_files() {
+	assert_eq!(
+		instruction_files(None, None),
+		Ok((
+			Some(format!("{FALLBACK}\n")),
+			Some(CLAUDE_IMPORT.to_owned())
+		))
+	);
+}
+
+#[test]
+fn moves_a_lone_claude_md_into_agents_md() {
+	let claude = "# Project\n\nRun `make test`.\n";
+	assert_eq!(
+		instruction_files(None, Some(claude)),
+		Ok((Some(with_fallback(claude)), Some(CLAUDE_IMPORT.to_owned())))
+	);
+}
+
+#[test]
+fn moves_a_lone_claude_md_that_mentions_agent_guidance_unchanged() {
+	let claude = format!("# Project\n\n{FALLBACK}\n");
+	assert_eq!(
+		instruction_files(None, Some(&claude)),
+		Ok((Some(claude.clone()), Some(CLAUDE_IMPORT.to_owned())))
+	);
+}
+
+#[test]
+fn prepends_to_a_lone_agents_md_and_creates_claude_md() {
+	let agents = "# Project\n";
+	assert_eq!(
+		instruction_files(Some(agents), None),
+		Ok((Some(with_fallback(agents)), Some(CLAUDE_IMPORT.to_owned())))
+	);
+}
+
+#[test]
+fn prepends_to_agents_md_when_claude_md_imports_it() {
+	let agents = "# Project\n";
+	assert_eq!(
+		instruction_files(Some(agents), Some(CLAUDE_IMPORT)),
+		Ok((Some(with_fallback(agents)), None))
+	);
+}
+
+#[test]
+fn leaves_a_claude_md_with_the_import_and_other_lines_alone() {
+	let agents = format!("{FALLBACK}\n\n# Project\n");
+	let claude = "@AGENTS.md\n\nUse Opus for reviews.\n";
+	assert_eq!(
+		instruction_files(Some(&agents), Some(claude)),
+		Ok((None, None))
+	);
+	assert_eq!(
+		instruction_files(Some("# Project\n"), Some(claude)),
+		Ok((Some(with_fallback("# Project\n")), None))
+	);
+}
+
+/// The earlier installer appended the fallback to both files instead of importing `AGENTS.md`.
+#[test]
+fn leaves_an_earlier_install_alone() {
+	let agents = format!("# Project\n\n{FALLBACK}\n");
+	let claude = format!("# Claude\n\n{FALLBACK}\n");
+	assert_eq!(
+		instruction_files(Some(&agents), Some(&claude)),
+		Ok((None, None))
+	);
+	assert_eq!(
+		instruction_files(Some(&agents), Some("# Claude\n")),
+		Ok((None, None))
+	);
+	assert_eq!(
+		instruction_files(Some("# Project\n"), Some(&claude)),
+		Ok((None, None))
+	);
+}
+
+#[test]
+fn refuses_separate_agents_and_claude_md() {
+	assert!(instruction_files(Some("# Project\n"), Some("# Claude\n")).is_err());
+	assert!(instruction_files(Some("# Project\n"), Some("Read AGENTS.md.\n")).is_err());
+}
+
+/// An import does not move into `AGENTS.md`, where it would import the file itself.
+#[test]
+fn keeps_an_importing_claude_md_when_agents_md_is_missing() {
+	let claude = "@AGENTS.md\n\nUse Opus for reviews.\n";
+	assert_eq!(
+		instruction_files(None, Some(claude)),
+		Ok((Some(format!("{FALLBACK}\n")), None))
+	);
+}
+
+#[test]
+fn treats_an_empty_agents_md_as_missing() {
+	let claude = "# Claude\n";
+	for agents in ["", "\n \n"] {
+		assert_eq!(
+			instruction_files(Some(agents), Some(claude)),
+			Ok((Some(with_fallback(claude)), Some(CLAUDE_IMPORT.to_owned()))),
+			"{agents:?}"
+		);
+	}
+}
+
+#[test]
+fn accepts_an_import_with_a_relative_path() {
+	assert_eq!(
+		instruction_files(Some("# Project\n"), Some("@./AGENTS.md\n")),
+		Ok((Some(with_fallback("# Project\n")), None))
+	);
+}
+
+/// An empty `CLAUDE.md` holds nothing to merge, so replacing it loses nothing.
+#[test]
+fn replaces_an_empty_claude_md_with_the_import() {
+	for claude in ["", "\n \n"] {
+		assert_eq!(
+			instruction_files(Some("# Project\n"), Some(claude)),
+			Ok((
+				Some(with_fallback("# Project\n")),
+				Some(CLAUDE_IMPORT.to_owned())
+			)),
+			"{claude:?}"
+		);
+	}
+}
+
+#[test]
+fn prepending_keeps_the_existing_text_byte_for_byte() {
+	let agents = "# Project\r\n\n  indented\ttext without a final newline";
+	let (new, _) = instruction_files(Some(agents), Some(CLAUDE_IMPORT)).expect("no refusal");
+	let new = new.expect("AGENTS.md changes");
+	let rest = new
+		.strip_prefix(FALLBACK)
+		.and_then(|rest| rest.strip_prefix("\n\n"))
+		.expect("the fallback comes first");
+	assert_eq!(rest, agents);
+}
+
+#[test]
+fn an_empty_agents_md_gets_only_the_fallback() {
+	for agents in ["", "\n", " \n\n"] {
+		assert_eq!(
+			instruction_files(Some(agents), Some(CLAUDE_IMPORT)),
+			Ok((Some(format!("{FALLBACK}\n")), None)),
+			"{agents:?}"
+		);
+	}
+}
+
+#[test]
+fn running_again_on_the_output_changes_nothing() {
+	let cases: [(Option<&str>, Option<&str>); 9] = [
+		(None, Some("@AGENTS.md\n\nUse Opus for reviews.\n")),
+		(Some(""), Some("# Claude\n")),
+		(Some("# Project\n"), Some("@./AGENTS.md\n")),
+		(None, None),
+		(None, Some("# Claude\n")),
+		(Some("# Project\n"), None),
+		(Some("# Project\n"), Some(CLAUDE_IMPORT)),
+		(Some("# Project\n"), Some("")),
+		(Some(""), Some(CLAUDE_IMPORT)),
+	];
+	for (agents, claude) in cases {
+		let (new_agents, new_claude) = instruction_files(agents, claude).expect("no refusal");
+		let agents = new_agents.as_deref().or(agents);
+		let claude = new_claude.as_deref().or(claude);
+		assert_eq!(
+			instruction_files(agents, claude),
+			Ok((None, None)),
+			"{agents:?} {claude:?}"
+		);
+	}
+}
+
 /// Without a matcher the hooks run for every session source, `fork` included.
 #[test]
 fn templates_have_no_matcher() {

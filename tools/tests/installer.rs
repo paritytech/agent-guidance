@@ -55,6 +55,11 @@ impl Repo {
 		fs::write(full, contents).expect("writing a file");
 	}
 
+	/// Creates the symbolic link `path` pointing to `target`.
+	fn symlink(&self, target: &str, path: &str) {
+		std::os::unix::fs::symlink(target, self.root.join(path)).expect("creating a symlink");
+	}
+
 	fn read(&self, path: &str) -> String {
 		fs::read_to_string(self.root.join(path)).unwrap_or_else(|e| panic!("reading {path}: {e}"))
 	}
@@ -70,7 +75,8 @@ impl Repo {
 			.expect("running the installer")
 	}
 
-	/// Contents and modes of every file outside `.git`, keyed by relative path.
+	/// Contents and modes of every file outside `.git`, keyed by relative path. A symbolic link
+	/// is recorded with its target as contents.
 	fn snapshot(&self) -> BTreeMap<PathBuf, (Vec<u8>, u32)> {
 		let mut files = BTreeMap::new();
 		let mut pending = vec![self.root.clone()];
@@ -80,19 +86,22 @@ impl Repo {
 				if path.file_name().is_some_and(|name| name == ".git") {
 					continue;
 				}
-				if path.is_dir() {
+				let metadata = fs::symlink_metadata(&path).expect("reading metadata");
+				if metadata.is_dir() {
 					pending.push(path);
-				} else {
-					let mode = fs::metadata(&path)
-						.expect("reading metadata")
-						.permissions()
-						.mode();
-					let relative = path
-						.strip_prefix(&self.root)
-						.expect("below the root")
-						.to_owned();
-					files.insert(relative, (fs::read(&path).expect("reading a file"), mode));
+					continue;
 				}
+				let contents = if metadata.is_symlink() {
+					let target = fs::read_link(&path).expect("reading a link");
+					target.into_os_string().into_encoded_bytes()
+				} else {
+					fs::read(&path).expect("reading a file")
+				};
+				let relative = path
+					.strip_prefix(&self.root)
+					.expect("below the root")
+					.to_owned();
+				files.insert(relative, (contents, metadata.permissions().mode()));
 			}
 		}
 		files
@@ -198,7 +207,7 @@ fn installs_into_an_empty_repository() {
 	repo.assert_hooks_installed();
 	assert_eq!(repo.read(".gitignore"), GITIGNORE_LINES);
 	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n"));
-	assert_eq!(repo.read("CLAUDE.md"), format!("{FALLBACK}\n"));
+	assert_eq!(repo.read("CLAUDE.md"), "@AGENTS.md\n");
 
 	let stdout = stdout(&output);
 	assert_eq!(
@@ -257,7 +266,7 @@ fn preserves_existing_content() {
 	);
 	repo.assert_hooks_installed();
 
-	assert_eq!(repo.read("AGENTS.md"), format!("{agents}\n\n{FALLBACK}\n"));
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n\n{agents}"));
 	assert_eq!(repo.read("CLAUDE.md"), claude);
 	assert_eq!(
 		repo.read(".gitignore"),
@@ -375,9 +384,512 @@ fn keeps_an_earlier_single_line_fallback() {
 }
 
 #[test]
+fn moves_a_lone_claude_md_into_agents_md() {
+	let repo = Repo::new();
+	let claude = "# Project\n\nBuild with make.\n";
+	repo.write("CLAUDE.md", claude);
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n\n{claude}"));
+	assert_eq!(repo.read("CLAUDE.md"), "@AGENTS.md\n");
+	repo.assert_second_run_changes_nothing();
+}
+
+/// Merging two sets of instructions is left to the maintainer, and the refusal comes before any
+/// write.
+#[test]
+fn writes_nothing_when_claude_md_does_not_import_agents_md() {
+	let repo = Repo::new();
+	repo.write("AGENTS.md", "# Project\n");
+	repo.write("CLAUDE.md", "# Claude\n");
+	let files = repo.snapshot();
+
+	let output = repo.install();
+	assert_eq!(output.status.code(), Some(1));
+	assert_eq!(
+		String::from_utf8_lossy(&output.stderr),
+		"error: AGENTS.md and CLAUDE.md both exist and CLAUDE.md does not import AGENTS.md.\n\
+		 No file was changed. Merge CLAUDE.md into AGENTS.md, replace CLAUDE.md with the line \
+		 @AGENTS.md, and run the installer again.\n"
+	);
+	assert_eq!(stdout(&output), "");
+	assert_eq!(repo.snapshot(), files);
+}
+
+/// A `CLAUDE.md` that links to `AGENTS.md` already gives Claude Code the same instructions, also
+/// when `AGENTS.md` does not exist yet.
+#[test]
+fn keeps_a_claude_md_that_links_to_agents_md() {
+	for (agents, link) in [
+		(Some("# Project\n\nBuild with make.\n"), "AGENTS.md"),
+		(Some(""), "AGENTS.md"),
+		(None, "AGENTS.md"),
+		(None, "./AGENTS.md"),
+	] {
+		let repo = Repo::new();
+		if let Some(agents) = agents {
+			repo.write("AGENTS.md", agents);
+		}
+		repo.symlink(link, "CLAUDE.md");
+		let output = repo.install();
+		assert!(
+			output.status.success(),
+			"{agents:?}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		let expected = match agents {
+			Some(agents) if !agents.is_empty() => format!("{FALLBACK}\n\n{agents}"),
+			_ => format!("{FALLBACK}\n"),
+		};
+		assert_eq!(repo.read("AGENTS.md"), expected, "{agents:?}");
+		let agents_md = fs::symlink_metadata(repo.root.join("AGENTS.md")).expect("AGENTS.md");
+		assert!(agents_md.file_type().is_file(), "{agents:?}");
+		assert_eq!(
+			fs::read_link(repo.root.join("CLAUDE.md")).expect("CLAUDE.md is still a symlink"),
+			Path::new(link)
+		);
+		assert!(!stdout(&output).contains("  CLAUDE.md\n"), "{agents:?}");
+		repo.assert_second_run_changes_nothing();
+	}
+}
+
+/// A hard link holds the same instructions under both names.
+#[test]
+fn keeps_a_claude_md_hard_linked_to_agents_md() {
+	let repo = Repo::new();
+	repo.write("AGENTS.md", "# Project\n");
+	fs::hard_link(repo.root.join("AGENTS.md"), repo.root.join("CLAUDE.md"))
+		.expect("creating a hard link");
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n\n# Project\n"));
+	assert_eq!(repo.read("CLAUDE.md"), repo.read("AGENTS.md"));
+	// Both names changed for git, so both are listed for `git add`.
+	let stdout = stdout(&output);
+	assert!(stdout.contains("  AGENTS.md\n"), "{stdout}");
+	assert!(stdout.contains("  CLAUDE.md\n"), "{stdout}");
+	assert!(stdout.contains(" AGENTS.md CLAUDE.md\n"), "{stdout}");
+	repo.assert_second_run_changes_nothing();
+}
+
+/// Writing through a link would change a file other than the one named.
+#[test]
+fn writes_nothing_through_a_link() {
+	// CLAUDE.md links elsewhere and would be replaced with the import.
+	let repo = Repo::new();
+	repo.write("docs/ai.md", "# Claude\n");
+	repo.symlink("docs/ai.md", "CLAUDE.md");
+	assert_refuses_links(&repo, &["CLAUDE.md"]);
+
+	// CLAUDE.md links to AGENTS.md, which links elsewhere and would get the fallback.
+	let repo = Repo::new();
+	repo.write("docs/ai.md", "# Project\n");
+	repo.symlink("docs/ai.md", "AGENTS.md");
+	repo.symlink("AGENTS.md", "CLAUDE.md");
+	assert_refuses_links(&repo, &["AGENTS.md"]);
+}
+
+/// A hook config directory that links elsewhere would have the config written into the target.
+#[test]
+fn writes_nothing_into_a_linked_directory() {
+	let repo = Repo::new();
+	fs::create_dir(repo.root.join("shared")).expect("creating a directory");
+	repo.symlink("shared", ".claude");
+	assert_refuses_links(&repo, &[".claude"]);
+}
+
+#[test]
+fn writes_nothing_through_a_linked_loader() {
+	let repo = Repo::new();
+	repo.write("shared/load.sh", "#!/bin/sh\nold loader\n");
+	fs::create_dir(repo.root.join(".agent-guidance-loader")).expect("creating a directory");
+	repo.symlink("../shared/load.sh", LOADER);
+	assert_refuses_links(&repo, &[LOADER]);
+
+	// Fixing only the mode would change the target too.
+	let repo = Repo::new();
+	repo.write("shared/load.sh", &template(LOADER));
+	fs::create_dir(repo.root.join(".agent-guidance-loader")).expect("creating a directory");
+	repo.symlink("../shared/load.sh", LOADER);
+	assert_refuses_links(&repo, &[LOADER]);
+}
+
+#[test]
+fn writes_nothing_through_a_linked_gitignore() {
+	let repo = Repo::new();
+	repo.write("shared/gitignore", "/target\n");
+	repo.symlink("shared/gitignore", ".gitignore");
+	assert_refuses_links(&repo, &[".gitignore"]);
+}
+
+/// Every link the installer would write through is named in one message.
+#[test]
+fn names_every_link_it_would_write_through() {
+	let repo = Repo::new();
+	fs::create_dir(repo.root.join("shared")).expect("creating a directory");
+	repo.symlink("shared", ".claude");
+	repo.write("shared/gitignore", "/target\n");
+	repo.symlink("shared/gitignore", ".gitignore");
+	repo.write("docs/ai.md", "# Claude\n");
+	repo.symlink("docs/ai.md", "CLAUDE.md");
+	assert_refuses_links(&repo, &[".claude", ".gitignore", "CLAUDE.md"]);
+}
+
+/// Links to files that are already up to date are not written, so a rerun works.
+#[test]
+fn keeps_links_to_up_to_date_files() {
+	let repo = Repo::new();
+	assert!(repo.install().status.success());
+
+	// A linked hook config.
+	fs::rename(
+		repo.root.join(".codex/hooks.json"),
+		repo.root.join("codex-hooks.json"),
+	)
+	.expect("moving the hook config");
+	repo.symlink("../codex-hooks.json", ".codex/hooks.json");
+	// A linked hook config directory.
+	fs::rename(repo.root.join(".claude"), repo.root.join("shared-claude"))
+		.expect("moving the directory");
+	repo.symlink("shared-claude", ".claude");
+	// A linked executable loader.
+	fs::rename(repo.root.join(LOADER), repo.root.join("load.sh")).expect("moving the loader");
+	repo.symlink("../load.sh", LOADER);
+
+	repo.assert_second_run_changes_nothing();
+}
+
+/// An `AGENTS.md` that links to `CLAUDE.md` makes both names one file, so the fallback goes into
+/// `CLAUDE.md`, also when it does not exist yet.
+#[test]
+fn writes_through_an_agents_md_that_links_to_claude_md() {
+	for (claude, link) in [
+		(Some("# Project\n"), "CLAUDE.md"),
+		(None, "CLAUDE.md"),
+		(Some("# Project\n"), "./CLAUDE.md"),
+	] {
+		let repo = Repo::new();
+		if let Some(claude) = claude {
+			repo.write("CLAUDE.md", claude);
+		}
+		repo.symlink(link, "AGENTS.md");
+		let output = repo.install();
+		assert!(
+			output.status.success(),
+			"{claude:?}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		let expected = match claude {
+			Some(claude) => format!("{FALLBACK}\n\n{claude}"),
+			None => format!("{FALLBACK}\n"),
+		};
+		let claude_md = fs::symlink_metadata(repo.root.join("CLAUDE.md")).expect("CLAUDE.md");
+		assert!(claude_md.file_type().is_file(), "{claude:?}");
+		assert_eq!(repo.read("CLAUDE.md"), expected, "{claude:?}");
+		assert_eq!(
+			fs::read_link(repo.root.join("AGENTS.md")).expect("AGENTS.md is still a symlink"),
+			Path::new(link)
+		);
+		// The real file is listed for `git add`, not the unchanged link.
+		let stdout = stdout(&output);
+		assert!(stdout.contains("  CLAUDE.md\n"), "{stdout}");
+		assert!(stdout.contains(" CLAUDE.md"), "{stdout}");
+		assert!(!stdout.contains("AGENTS.md"), "{stdout}");
+		repo.assert_second_run_changes_nothing();
+	}
+}
+
+/// Runs the installer and asserts that it refuses because of `links`, in this order, and changes
+/// no file.
+fn assert_refuses_links(repo: &Repo, links: &[&str]) {
+	let files = repo.snapshot();
+	let output = repo.install();
+	assert_eq!(output.status.code(), Some(1), "{links:?}");
+	let listed: String = links.iter().map(|link| format!("  {link}\n")).collect();
+	assert_eq!(
+		String::from_utf8_lossy(&output.stderr),
+		format!(
+			"error: the installer does not write through symbolic links, and it would write \
+			 through these:\n{listed}No file was changed. Replace each link with a regular file \
+			 or directory and run the installer again.\n"
+		)
+	);
+	assert_eq!(stdout(&output), "", "{links:?}");
+	assert_eq!(repo.snapshot(), files, "{links:?}");
+}
+
+/// A link that the installer does not need to write is fine.
+#[test]
+fn keeps_a_linked_claude_md_that_imports_agents_md() {
+	let repo = Repo::new();
+	repo.write("docs/ai.md", "@AGENTS.md\n\nUse Opus for reviews.\n");
+	repo.symlink("docs/ai.md", "CLAUDE.md");
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(repo.read("AGENTS.md"), format!("{FALLBACK}\n"));
+	assert_eq!(
+		fs::read_link(repo.root.join("CLAUDE.md")).expect("CLAUDE.md is still a symlink"),
+		Path::new("docs/ai.md")
+	);
+	repo.assert_second_run_changes_nothing();
+}
+
+/// Runs `git check-ignore` on `path` in `repo` and returns whether git ignores it.
+fn git_ignores(repo: &Repo, path: &str) -> bool {
+	let output = isolate(Command::new("git").arg("-C").arg(&repo.root).args([
+		"check-ignore",
+		"-q",
+		"--",
+		path,
+	]))
+	.output()
+	.expect("running git check-ignore");
+	match output.status.code() {
+		Some(0) => true,
+		Some(1) => false,
+		_ => panic!(
+			"git check-ignore {path}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		),
+	}
+}
+
+/// Sets `core.excludesFile` of `repo` to a file with `patterns`, like a global excludes file.
+fn exclude_globally(repo: &Repo, patterns: &str) {
+	let excludes = repo.root.join(".git/global-excludes");
+	fs::write(&excludes, patterns).expect("writing the excludes file");
+	git(
+		&repo.root,
+		&["config", "core.excludesFile", &excludes.to_string_lossy()],
+	);
+}
+
+const EXCLUDE: &str = ".git/info/exclude";
+
+/// Runs the installer, asserts that it succeeds without warnings, that it reports the exclude
+/// file, and that the tracked `.gitignore` holds only the cache lines.
+fn assert_reincluded(repo: &Repo) {
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+	let stdout = stdout(&output);
+	assert!(
+		stdout.contains(&format!("Re-included ignored hook configs in {EXCLUDE}")),
+		"{stdout}"
+	);
+	assert!(!stdout.contains(&format!("  {EXCLUDE}\n")), "{stdout}");
+	assert!(!stdout.contains(&format!(" {EXCLUDE} ")), "{stdout}");
+	assert!(!stdout.contains("git add -f"), "{stdout}");
+	assert_eq!(repo.read(".gitignore"), GITIGNORE_LINES);
+	for path in MERGED_CONFIGS
+		.map(|(path, _)| path)
+		.iter()
+		.chain([&COPILOT_CONFIG])
+	{
+		assert!(!git_ignores(repo, path), "{path}");
+	}
+	let exclude = repo.read(EXCLUDE);
+	repo.assert_second_run_changes_nothing();
+	assert_eq!(repo.read(EXCLUDE), exclude);
+}
+
+/// A global excludes file that ignores `.claude/` and `.codex/` would keep the hook configs out
+/// of a plain `git add`. The installer re-includes them in the local exclude file, not in the
+/// shared `.gitignore`, and keeps the rest of each directory ignored.
+#[test]
+fn reincludes_hook_configs_that_git_ignores() {
+	let repo = Repo::new();
+	exclude_globally(&repo, ".claude/\n.codex/\n");
+	assert!(git_ignores(&repo, ".claude/settings.json"));
+	let exclude = repo.read(EXCLUDE);
+
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		format!(
+			"{exclude}!/.claude/\n/.claude/*\n!/.claude/settings.json\n\
+			 !/.codex/\n/.codex/*\n!/.codex/hooks.json\n"
+		)
+	);
+	assert!(git_ignores(&repo, ".codex/worktrees/x"));
+	assert!(git_ignores(&repo, ".claude/settings.local.json"));
+}
+
+/// The lines come after an existing `/.codex/` line in the exclude file, so they win.
+#[test]
+fn reincludes_a_hook_config_that_the_exclude_file_ignores() {
+	let repo = Repo::new();
+	repo.write(EXCLUDE, "/.codex/\n");
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		"/.codex/\n!/.codex/\n/.codex/*\n!/.codex/hooks.json\n"
+	);
+	assert!(git_ignores(&repo, ".codex/worktrees/x"));
+}
+
+/// Only an ignored directory gets the lines that re-include it and ignore the rest of it.
+#[test]
+fn reincludes_an_ignored_hook_config_in_a_directory_git_does_not_ignore() {
+	let repo = Repo::new();
+	repo.write(EXCLUDE, "agent-guidance.json\n");
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		"agent-guidance.json\n!/.github/hooks/agent-guidance.json\n"
+	);
+}
+
+/// Every ignored directory above the file is re-included, from the top down.
+#[test]
+fn reincludes_a_hook_config_below_an_ignored_ancestor() {
+	let repo = Repo::new();
+	exclude_globally(&repo, ".github/\n");
+	let exclude = repo.read(EXCLUDE);
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		format!(
+			"{exclude}!/.github/\n/.github/*\n!/.github/hooks/\n/.github/hooks/*\n\
+			 !/.github/hooks/agent-guidance.json\n"
+		)
+	);
+	assert!(git_ignores(&repo, ".github/workflows/ci.yml"));
+}
+
+/// The group is added again unless it is already there as a whole and in order: a file line
+/// before the directory lines does not re-include the file.
+#[test]
+fn adds_the_whole_group_when_its_lines_are_out_of_order() {
+	let repo = Repo::new();
+	let existing = "/.codex/\n!/.codex/hooks.json\n!/.codex/\n/.codex/*\n";
+	repo.write(EXCLUDE, existing);
+	assert!(git_ignores(&repo, ".codex/hooks.json"));
+	assert_reincluded(&repo);
+	assert_eq!(
+		repo.read(EXCLUDE),
+		format!("{existing}!/.codex/\n/.codex/*\n!/.codex/hooks.json\n")
+	);
+}
+
+/// In a linked worktree the lines go to the exclude file that git reads there.
+#[test]
+fn reincludes_hook_configs_in_a_linked_worktree() {
+	let repo = Repo::new();
+	git(
+		&repo.root,
+		&["commit", "-q", "--allow-empty", "-m", "initial"],
+	);
+	let dir = tempdir();
+	let worktree = dir.path().join("worktree");
+	git(
+		&repo.root,
+		&["worktree", "add", "-q", &worktree.to_string_lossy()],
+	);
+	exclude_globally(&repo, ".claude/\n");
+
+	let output = isolate(Command::new(INSTALLER).arg(&worktree))
+		.output()
+		.expect("running the installer");
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+	let exclude = git(&worktree, &["rev-parse", "--git-path", "info/exclude"]);
+	let exclude = worktree.join(exclude.trim_end());
+	let text = fs::read_to_string(&exclude).expect("reading the exclude file");
+	assert!(
+		text.ends_with("!/.claude/\n/.claude/*\n!/.claude/settings.json\n"),
+		"{text}"
+	);
+	let ignored = isolate(Command::new("git").arg("-C").arg(&worktree).args([
+		"check-ignore",
+		"-q",
+		".claude/settings.json",
+	]))
+	.status()
+	.expect("running git check-ignore");
+	assert_eq!(ignored.code(), Some(1));
+}
+
+/// When the lines do not help, because the repository's own `.gitignore` ignores the hook
+/// config, the installer warns and does not claim to have re-included it.
+#[test]
+fn does_not_report_a_reinclude_that_has_no_effect() {
+	let repo = Repo::new();
+	repo.write(".gitignore", ".claude/\n");
+	let output = repo.install();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	let stdout = stdout(&output);
+	assert!(!stdout.contains("Re-included"), "{stdout}");
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("warning: git ignores .claude/settings.json"),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(git_ignores(&repo, ".claude/settings.json"));
+	repo.assert_second_run_changes_nothing();
+}
+
+/// Exclude lines are anchored at the top level, so below it the installer only warns.
+#[test]
+fn leaves_the_exclude_file_alone_below_the_top_level() {
+	let repo = Repo::new();
+	exclude_globally(&repo, ".claude/\n");
+	let exclude = repo.read(EXCLUDE);
+	let sub = repo.root.join("sub");
+	fs::create_dir(&sub).expect("creating a directory");
+
+	let output = isolate(Command::new(INSTALLER).arg(&sub))
+		.output()
+		.expect("running the installer");
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(repo.read(EXCLUDE), exclude);
+	assert!(
+		!stdout(&output).contains("Re-included"),
+		"{}",
+		stdout(&output)
+	);
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("warning: git ignores .claude/settings.json"),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+}
+
+/// A tracked `.gitignore` takes precedence over the lines the installer adds to the exclude file.
+#[test]
 fn warns_about_ignored_files() {
 	let repo = Repo::new();
-	repo.write(".git/info/exclude", ".codex/\n");
+	repo.write(".codex/.gitignore", "*\n");
 	let output = repo.install();
 	assert!(
 		output.status.success(),
