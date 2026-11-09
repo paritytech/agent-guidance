@@ -1,15 +1,6 @@
 # Orchestration
 
-How to split work between a top-level agent and subagents, what goes in a brief, and how changes
-get reviewed. This applies to single-step tasks too.
-
-## Why delegate by default
-
-- The orchestrator's context holds the user's intent, the plan, decisions and evidence. File dumps
-  and build logs fill it.
-- An orchestrator that is not busy editing stays responsive to new requests from the user.
-- The orchestrator knows the whole task, so it writes a better brief than a worker would write for
-  itself.
+Guidance in case you are working as the agent swarm coordinator.
 
 ## Roles
 
@@ -87,6 +78,4 @@ A worker knows only what the brief says. Include:
   setting up cross-compilation, changing global config. If a platform cannot be checked here, say
   so instead.
 - Do not take screenshots of the user's screen or launch their apps while they may be using them.
-- If subagents or independent review are not available, stop the affected work, say why, and ask
-  the user for an exception. Do not fall back to doing it yourself silently.
 - Delegation and review do not grant permission to publish, merge, or widen the task.
