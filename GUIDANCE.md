@@ -31,6 +31,8 @@ included.
 - Never force-push, rebase or amend a branch with an open PR. Add commits on top, so reviewers keep
   their state.
 - One topic per PR. Unrelated fixes go in their own PR.
+- Never add a `Co-Authored-By`, `Co-Developed-By` or similar trailer that lists an AI model
+  instead of a human being.
 - Before opening a PR, review the change with the procedure in
   `.agent-guidance/guidance/code-review.md` (as for someone else's PR, without posting) and fix
   what it raises.
