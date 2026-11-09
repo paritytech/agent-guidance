@@ -106,6 +106,22 @@ commands, so push access here is high-trust: a change steers the agents of every
   - Codex moves anything longer than about 2,500 tokens to a file.
 - Do not use XML-style tags: Gemini CLI escapes `<` and `>` in injected context.
 
+## Hivemind
+
+Collective memory serves us best if it is continuously updated.
+
+Hivemind is a skill that finds what to change in the guidance from your own agent sessions. Run it
+now and then from this checkout: `/hivemind` in Claude Code, `$hivemind` in Codex, or ask your
+agent for hivemind.
+
+- It reads your local Claude Code and Codex sessions that loaded the guidance.
+- It looks for guidance bugs, contradictions, ignored rules and corrections you had to repeat.
+- It leaves out personal preferences and repository-specific rules, and says where they belong
+  instead.
+- It reports the findings and opens a PR only for the ones you pick.
+
+The skill lives in `.agents/skills/hivemind/`, with a symlink in `.claude/skills/` for Claude Code.
+
 ## Development
 
 The installer, its templates and the tests live in the `tools/` crate. The templates in
