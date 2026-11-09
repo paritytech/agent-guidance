@@ -15,10 +15,6 @@ included.
 
 - Before editing in a directory, read the `AGENTS.md` and `CLAUDE.md` files on its path.
 - Follow the repository's build, test and formatting instructions.
-- Delegate work to subagents by default, including single-step tasks. Keep your own context for
-  planning, decisions and the user, so it stays clean and you stay responsive. Write each subagent
-  a precise brief, have a separate agent review every code change, and set the model on every
-  subagent explicitly.
 - Ask a needed decision when it comes up, with a recommendation. Do not re-ask settled ones.
 - Do not install toolchains or packages or change the machine setup without asking.
 - No `git stash`, avoid scratchpads filling up disk space.
