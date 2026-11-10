@@ -111,8 +111,7 @@ Hooks run only in a trusted workspace. Details are in [docs/harnesses.md](docs/h
 Collective memory serves us best if it is continuously updated.
 
 Hivemind is a skill that finds what to change in the guidance from your own agent sessions. Run it
-now and then from this checkout: `/hivemind` in Claude Code, `$hivemind` in Codex, or ask your
-agent for hivemind.
+now and then from this checkout: `/hivemind` in Claude Code or `$hivemind` in Codex.
 
 - It reads your local Claude Code and Codex sessions that loaded the guidance.
 - It looks for guidance bugs, contradictions, ignored rules and corrections you had to repeat.
