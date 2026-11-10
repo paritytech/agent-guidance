@@ -8,10 +8,14 @@
 //! at the top of `AGENTS.md`, and makes `CLAUDE.md` import `AGENTS.md`.
 //! Running it again changes nothing unless the templates changed. It never commits; it prints the
 //! files to review and add.
+//!
+//! `agent-guidance-install --user` instead writes the loader to `~/.claude/agent-guidance/load.sh`
+//! and adds a SessionStart hook that runs it in user mode to `~/.claude/settings.json`, so Claude
+//! Code loads the guidance in every repository. It touches no repository.
 
 use serde_json::{Map, Value};
 use std::{
-	ffi::OsStr,
+	ffi::{OsStr, OsString},
 	fs, io,
 	os::unix::{
 		ffi::OsStrExt,
@@ -27,6 +31,18 @@ use std::{
 const LOADER_PATH: &str = ".agent-guidance-loader/load.sh";
 
 const LOADER: &str = include_str!("../templates/.agent-guidance-loader/load.sh");
+
+/// Path of the user-level loader, relative to the home directory.
+///
+/// The user hook command contains it, so it also identifies an already installed user hook entry.
+const USER_LOADER_PATH: &str = ".claude/agent-guidance/load.sh";
+
+/// The user-level Claude Code settings, relative to the home directory, and the template merged
+/// into them.
+const USER_CONFIG: (&str, &str) = (
+	".claude/settings.json",
+	include_str!("../templates/user/.claude/settings.json"),
+);
 
 /// Command that updates this installer, and with it the loader it embeds.
 const UPDATE_INSTALLER: &str = "cargo install --git https://github.com/paritytech/agent-guidance";
@@ -133,10 +149,17 @@ fn instruction_files(
 const GITIGNORE_LINES: [&str; 2] = ["/.agent-guidance/", "/.agent-guidance.tmp.*/"];
 
 const USAGE: &str = "usage: agent-guidance-install [ROOT]
+       agent-guidance-install --user
 
 Installs the agent guidance loader and hook configs into the repository at ROOT
 (default: the top level of the git repository that contains the current
-directory). To upgrade the loader, update the installer, then run it again:
+directory).
+
+With --user, installs the loader into ~/.claude/agent-guidance/ and adds a
+SessionStart hook to ~/.claude/settings.json, so Claude Code loads the guidance
+in every repository. Repositories with their own loader hook are skipped.
+
+To upgrade the loader, update the installer, then run it again:
 
   cargo install --git https://github.com/paritytech/agent-guidance";
 
@@ -165,34 +188,34 @@ fn is_newer(a: &str, b: &str) -> bool {
 /// Shell text in the Codex template's command that finds the repository root.
 const REPOSITORY_ROOT: &str = "$(git rev-parse --show-toplevel)";
 
-/// Whether the shell command `command` runs the loader and nothing else.
+/// Whether the shell command `command` runs the loader at `loader` and nothing else.
 ///
 /// It must contain the loader path and no shell syntax that runs a second command: `;`, `&`,
 /// `|`, a line break, a backtick, `$(`, `<(` or `>(`. The Codex template's [`REPOSITORY_ROOT`]
 /// is allowed.
-fn plain_loader_command(command: &str) -> bool {
+fn plain_loader_command(command: &str, loader: &str) -> bool {
 	let rest = command.replace(REPOSITORY_ROOT, "");
-	command.contains(LOADER_PATH)
+	command.contains(loader)
 		&& !rest.contains([';', '&', '|', '\n', '\r', '`'])
 		&& !["$(", "<(", ">("]
 			.iter()
 			.any(|syntax| rest.contains(syntax))
 }
 
-/// Whether the hook entry `entry` runs the loader and nothing else, so replacing it loses no
-/// other hook.
+/// Whether the hook entry `entry` runs the loader at `loader` and nothing else, so replacing it
+/// loses no other hook.
 ///
 /// A Claude Code, Codex or Gemini CLI entry is a group with a `hooks` array. Every hook in it
 /// must be a command hook (`type` missing or `"command"`) whose `command` passes
 /// [`plain_loader_command`]. A Cursor entry has no group and must be such a hook itself. Other
 /// keys of the entry, such as a `matcher` or a `timeout`, do not matter.
-fn loader_only(entry: &Value) -> bool {
+fn loader_only(entry: &Value, loader: &str) -> bool {
 	let loader_hook = |hook: &Value| {
 		hook.get("type").is_none_or(|kind| kind == "command")
 			&& hook
 				.get("command")
 				.and_then(Value::as_str)
-				.is_some_and(plain_loader_command)
+				.is_some_and(|command| plain_loader_command(command, loader))
 	};
 	match entry.get("hooks") {
 		Some(Value::Array(hooks)) => !hooks.is_empty() && hooks.iter().all(loader_hook),
@@ -202,6 +225,10 @@ fn loader_only(entry: &Value) -> bool {
 }
 
 /// Adds or updates the loader entry of `template` in the `event` hooks of an existing config.
+///
+/// An entry runs the loader when any string in it contains `loader`, the loader's path:
+/// [`LOADER_PATH`] for a repository, [`USER_LOADER_PATH`] for the user hook. Entries that run
+/// the other loader count as the user's own.
 ///
 /// Returns the new file contents, or `None` when the only entry for `event` that runs the loader
 /// equals the template's entry. Without such an entry the template's entry is appended.
@@ -213,15 +240,21 @@ fn loader_only(entry: &Value) -> bool {
 /// An error means that the config is not JSON, does not have the expected shape, or has an
 /// entry that runs more than the loader (see [`loader_only`]), which replacing it would delete.
 /// The caller must leave the file untouched.
-fn merge_hook(existing: &str, template: &str, event: &str) -> Result<Option<String>, String> {
-	fn runs_loader(value: &Value) -> bool {
+fn merge_hook(
+	existing: &str,
+	template: &str,
+	event: &str,
+	loader: &str,
+) -> Result<Option<String>, String> {
+	fn contains(value: &Value, loader: &str) -> bool {
 		match value {
-			Value::String(s) => s.contains(LOADER_PATH),
-			Value::Array(items) => items.iter().any(runs_loader),
-			Value::Object(map) => map.values().any(runs_loader),
+			Value::String(s) => s.contains(loader),
+			Value::Array(items) => items.iter().any(|item| contains(item, loader)),
+			Value::Object(map) => map.values().any(|item| contains(item, loader)),
 			_ => false,
 		}
 	}
+	let runs_loader = |value: &Value| contains(value, loader);
 
 	let template: Map<String, Value> =
 		serde_json::from_str(template).map_err(|e| format!("invalid template: {e}"))?;
@@ -259,7 +292,7 @@ fn merge_hook(existing: &str, template: &str, event: &str) -> Result<Option<Stri
 	{
 		return Ok(None);
 	}
-	if loaders.iter().any(|e| !loader_only(e)) {
+	if loaders.iter().any(|e| !loader_only(e, loader)) {
 		return Err(format!(
 			"an entry in `hooks.{event}` runs more than the loader"
 		));
@@ -352,20 +385,124 @@ fn ignores(text: &str, line: &str) -> bool {
 /// Files to write, relative to the repository root, with their new contents.
 type Plan = Vec<(&'static str, String)>;
 
-/// Writes files below the repository root and records which ones changed.
+/// Writes files below the repository root, or the home directory, and records which ones changed.
 struct Installer {
 	root: PathBuf,
 	/// Paths written by this run, relative to `root`.
 	changed: Vec<&'static str>,
+	/// Shown before a path relative to `root` in messages: empty for a repository, `~/` for the
+	/// home directory.
+	prefix: &'static str,
 }
 
 impl Installer {
+	/// Compares the loader at `loader` with the embedded one and returns the line that reports
+	/// the versions.
+	///
+	/// The version is read from the `LOADER_VERSION` line, without running the file. An error
+	/// means that the loader cannot be read, or that it is newer than the embedded one: an
+	/// installer built before a version bump would downgrade it, and its hook configs can be as
+	/// old as its loader. The caller must then write nothing.
+	fn loader_report(&self, loader: &str) -> Result<String, String> {
+		let embedded = loader_version(LOADER).expect("the embedded loader sets LOADER_VERSION");
+		let shown = format!("{}{loader}", self.prefix);
+		let existing = match fs::read(self.root.join(loader)) {
+			Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+			Err(e) => return Err(format!("reading {shown}: {e}")),
+		};
+		Ok(match existing.as_deref().and_then(loader_version) {
+			Some(version) if is_newer(version, embedded) => {
+				return Err(format!(
+					"{shown} is loader v{version}, newer than v{embedded} from this installer.\n\
+					 No file was changed. Update the installer and run it again:\n  \
+					 {UPDATE_INSTALLER}"
+				));
+			}
+			Some(version) if version == embedded => format!("loader v{embedded} (current)"),
+			Some(version) => format!("loader v{version} -> v{embedded}"),
+			None => format!("loader ? -> v{embedded}"),
+		})
+	}
+
+	/// Whether `path` is a symbolic link.
+	fn is_symlink(&self, path: &str) -> bool {
+		fs::symlink_metadata(self.root.join(path))
+			.is_ok_and(|metadata| metadata.file_type().is_symlink())
+	}
+
+	/// Prints an error and returns `true` when writing `plan` would write through a symbolic link.
+	///
+	/// A write through a link would change the link's target, which can be any file, or create
+	/// it. Each planned path and every directory above it below the root count. So does the
+	/// loader at `loader` when it lacks an executable bit, since [`Self::write_plan`] sets it.
+	fn refuse_links(&self, plan: &Plan, loader: &'static str) -> bool {
+		let mut written: Vec<&str> = plan.iter().map(|(path, _)| *path).collect();
+		if fs::metadata(self.root.join(loader))
+			.is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0o111)
+			&& !written.contains(&loader)
+		{
+			written.push(loader);
+		}
+		let mut links: Vec<&str> = Vec::new();
+		for path in written {
+			for part in ancestors(path).into_iter().chain([path]) {
+				if self.is_symlink(part) && !links.contains(&part) {
+					links.push(part);
+				}
+			}
+		}
+		if links.is_empty() {
+			return false;
+		}
+		let listed: String = links
+			.iter()
+			.map(|link| format!("  {}{link}\n", self.prefix))
+			.collect();
+		eprintln!(
+			"error: the installer does not write through symbolic links, and it would write \
+			 through these:\n{listed}No file was changed. Replace each link with a regular file \
+			 or directory and run the installer again."
+		);
+		true
+	}
+
+	/// Writes `plan`, then gives the loader at `loader` mode 755 when it lacks an executable bit.
+	///
+	/// git records only the executable bit, so a checkout may have 775 or 755 depending on the
+	/// umask. Only a missing executable bit is a change.
+	fn write_plan(&mut self, plan: &Plan, loader: &'static str) -> Result<(), String> {
+		for (path, contents) in plan {
+			self.write(path, contents)?;
+		}
+		let full = self.root.join(loader);
+		let mut permissions = fs::metadata(&full)
+			.map_err(|e| format!("reading {}{loader}: {e}", self.prefix))?
+			.permissions();
+		if permissions.mode() & 0o111 != 0o111 {
+			permissions.set_mode(0o755);
+			fs::set_permissions(&full, permissions)
+				.map_err(|e| format!("setting the mode of {}{loader}: {e}", self.prefix))?;
+			if !self.changed.contains(&loader) {
+				self.changed.push(loader);
+			}
+		}
+		Ok(())
+	}
+
+	/// Drops the files from `plan` that already hold the planned bytes.
+	fn drop_unchanged(&self, plan: &mut Plan) {
+		plan.retain(|(path, contents)| {
+			!fs::read(self.root.join(path)).is_ok_and(|old| old == contents.as_bytes())
+		});
+	}
+
 	/// Reads `path`, or returns `None` when it does not exist.
 	fn read(&self, path: &str) -> Result<Option<String>, String> {
 		match fs::read_to_string(self.root.join(path)) {
 			Ok(text) => Ok(Some(text)),
 			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-			Err(e) => Err(format!("reading {path}: {e}")),
+			Err(e) => Err(format!("reading {}{path}: {e}", self.prefix)),
 		}
 	}
 
@@ -379,7 +516,7 @@ impl Installer {
 			fs::create_dir_all(parent)
 				.map_err(|e| format!("creating {}: {e}", parent.display()))?;
 		}
-		fs::write(&full, contents).map_err(|e| format!("writing {path}: {e}"))?;
+		fs::write(&full, contents).map_err(|e| format!("writing {}{path}: {e}", self.prefix))?;
 		if !self.changed.contains(&path) {
 			self.changed.push(path);
 		}
@@ -435,8 +572,96 @@ fn append_line(text: &mut String, line: &str) {
 	text.push('\n');
 }
 
+/// The error printed for a hook config at `shown` that `merge_hook` refused with `e`.
+fn merge_failure(shown: &str, e: &str, template: &str) -> String {
+	format!(
+		"error: {shown}: {e}\n\
+		 The file was left unchanged. Add or update its loader hook by hand to match:\n{template}"
+	)
+}
+
+/// Installs the user-level loader and its hook into the home directory, `$HOME`.
+///
+/// Writes [`USER_LOADER_PATH`] and merges the user hook entry into the settings of
+/// [`USER_CONFIG`], with the same version check and merge rules as a repository install. No other
+/// file is written and git is not run.
+///
+/// Unlike a repository install, it writes through symbolic links below `HOME`, such as a
+/// `~/.claude` or `~/.claude/settings.json` kept in a dotfiles repository: the link's target is
+/// updated and the link stays.
+fn install_user() -> ExitCode {
+	let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+		eprintln!("error: HOME is not set; --user installs into $HOME/.claude");
+		return ExitCode::from(2);
+	};
+	let home = PathBuf::from(home);
+	if !home.is_dir() {
+		eprintln!("error: HOME ({}) is not a directory", home.display());
+		return ExitCode::from(2);
+	}
+	let mut installer = Installer {
+		root: home,
+		changed: Vec::new(),
+		prefix: "~/",
+	};
+	let loader_report = match installer.loader_report(USER_LOADER_PATH) {
+		Ok(report) => report,
+		Err(e) => {
+			eprintln!("error: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	let (path, template) = USER_CONFIG;
+	let mut plan = vec![(USER_LOADER_PATH, LOADER.to_owned())];
+	let mut merge_error = None;
+	match installer.read(path) {
+		Ok(None) => plan.push((path, template.to_owned())),
+		Ok(Some(existing)) => {
+			match merge_hook(&existing, template, "SessionStart", USER_LOADER_PATH) {
+				Ok(Some(merged)) => plan.push((path, merged)),
+				Ok(None) => {}
+				Err(e) => merge_error = Some(merge_failure(&format!("~/{path}"), &e, template)),
+			}
+		}
+		Err(e) => {
+			eprintln!("error: {e}");
+			return ExitCode::FAILURE;
+		}
+	}
+	installer.drop_unchanged(&mut plan);
+	if let Some(e) = &merge_error {
+		eprintln!("{e}");
+	}
+	if let Err(e) = installer.write_plan(&plan, USER_LOADER_PATH) {
+		eprintln!("error: {e}");
+		return ExitCode::FAILURE;
+	}
+	println!("{loader_report}");
+	if installer.changed.is_empty() {
+		println!("Nothing to change.");
+	} else {
+		println!("Changed files:");
+		for path in &installer.changed {
+			println!("  ~/{path}");
+		}
+	}
+	if merge_error.is_some() {
+		ExitCode::FAILURE
+	} else {
+		ExitCode::SUCCESS
+	}
+}
+
 fn main() -> ExitCode {
-	let mut args = std::env::args_os().skip(1);
+	let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+	if args.iter().any(|arg| arg == "--user") {
+		if args.len() > 1 {
+			eprintln!("error: --user takes no other argument\n\n{USAGE}");
+			return ExitCode::from(2);
+		}
+		return install_user();
+	}
+	let mut args = args.into_iter();
 	let root = match (args.next(), args.next()) {
 		(None, _) => {
 			let toplevel = Command::new("git")
@@ -477,36 +702,17 @@ fn main() -> ExitCode {
 		return ExitCode::from(2);
 	}
 
-	let embedded = loader_version(LOADER).expect("the embedded loader sets LOADER_VERSION");
-	let loader = root.join(LOADER_PATH);
-	let existing = match fs::read(&loader) {
-		Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-		Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-		Err(e) => {
-			eprintln!("error: reading {LOADER_PATH}: {e}");
-			return ExitCode::FAILURE;
-		}
-	};
-	let existing = existing.as_deref().and_then(loader_version);
-	// An installer built before a version bump would downgrade the loader, and its hook configs
-	// can be as old as its loader, so it writes nothing.
-	if let Some(version) = existing.filter(|version| is_newer(version, embedded)) {
-		eprintln!(
-			"error: {LOADER_PATH} is loader v{version}, newer than v{embedded} from this \
-			 installer.\nNo file was changed. Update the installer and run it again:\n  \
-			 {UPDATE_INSTALLER}"
-		);
-		return ExitCode::FAILURE;
-	}
-	let loader_report = match existing {
-		Some(version) if version == embedded => format!("loader v{embedded} (current)"),
-		Some(version) => format!("loader v{version} -> v{embedded}"),
-		None => format!("loader ? -> v{embedded}"),
-	};
-
 	let mut installer = Installer {
 		root,
 		changed: Vec::new(),
+		prefix: "",
+	};
+	let loader_report = match installer.loader_report(LOADER_PATH) {
+		Ok(report) => report,
+		Err(e) => {
+			eprintln!("error: {e}");
+			return ExitCode::FAILURE;
+		}
 	};
 	// A refusal to merge AGENTS.md and CLAUDE.md, like a downgrade, leaves every file unchanged.
 	// When one name links to the other, including a dangling link, or both are hard links to one
@@ -560,11 +766,8 @@ fn main() -> ExitCode {
 			.collect()
 	};
 	// A CLAUDE.md hard-linked to AGENTS.md changes with it, and git sees both names change.
-	let symlink = |path| {
-		fs::symlink_metadata(installer.root.join(path))
-			.is_ok_and(|metadata| metadata.file_type().is_symlink())
-	};
-	let hard_linked = linked && !symlink("AGENTS.md") && !symlink("CLAUDE.md");
+	let hard_linked =
+		linked && !installer.is_symlink("AGENTS.md") && !installer.is_symlink("CLAUDE.md");
 
 	// Every file the installer writes is planned first, so that a refusal changes nothing.
 	let planned = (|| -> Result<(Plan, Vec<String>), String> {
@@ -576,14 +779,10 @@ fn main() -> ExitCode {
 				plan.push((path, template.to_owned()));
 				continue;
 			};
-			match merge_hook(&existing, template, event) {
+			match merge_hook(&existing, template, event, LOADER_PATH) {
 				Ok(Some(merged)) => plan.push((path, merged)),
 				Ok(None) => {}
-				Err(e) => merge_errors.push(format!(
-					"error: {path}: {e}\n\
-					 The file was left unchanged. Add or update its loader hook by hand to \
-					 match:\n{template}"
-				)),
+				Err(e) => merge_errors.push(merge_failure(path, &e, template)),
 			}
 		}
 		plan.push((COPILOT_CONFIG.0, COPILOT_CONFIG.1.to_owned()));
@@ -598,10 +797,7 @@ fn main() -> ExitCode {
 			plan.push((".gitignore", text));
 		}
 		plan.extend(writes);
-		// A file that already holds the planned bytes is not written.
-		plan.retain(|(path, contents)| {
-			!fs::read(installer.root.join(path)).is_ok_and(|old| old == contents.as_bytes())
-		});
+		installer.drop_unchanged(&mut plan);
 		Ok((plan, merge_errors))
 	})();
 	let (plan, merge_errors) = match planned {
@@ -611,32 +807,7 @@ fn main() -> ExitCode {
 			return ExitCode::FAILURE;
 		}
 	};
-	// git records only the executable bit, so a checkout may have 775 or 755 depending on the
-	// umask. Only a missing executable bit is a change, and setting the mode writes the file too.
-	let loader_mode =
-		fs::metadata(&loader).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0o111);
-
-	// A write through a link would change the link's target, which can be any file, or create it.
-	// The path and every directory above it below the root count.
-	let mut links: Vec<&str> = Vec::new();
-	let mut written: Vec<&str> = plan.iter().map(|(path, _)| *path).collect();
-	if loader_mode && !written.contains(&LOADER_PATH) {
-		written.push(LOADER_PATH);
-	}
-	for path in written {
-		for part in ancestors(path).into_iter().chain([path]) {
-			if symlink(part) && !links.contains(&part) {
-				links.push(part);
-			}
-		}
-	}
-	if !links.is_empty() {
-		let listed: String = links.iter().map(|link| format!("  {link}\n")).collect();
-		eprintln!(
-			"error: the installer does not write through symbolic links, and it would write \
-			 through these:\n{listed}No file was changed. Replace each link with a regular file \
-			 or directory and run the installer again."
-		);
+	if installer.refuse_links(&plan, LOADER_PATH) {
 		return ExitCode::FAILURE;
 	}
 
@@ -648,20 +819,7 @@ fn main() -> ExitCode {
 	// it ignored. The file is not committed.
 	let mut reincluded = None;
 	let result = (|| -> Result<(), String> {
-		for (path, contents) in &plan {
-			installer.write(path, contents)?;
-		}
-		let mut permissions = fs::metadata(&loader)
-			.map_err(|e| format!("reading {LOADER_PATH}: {e}"))?
-			.permissions();
-		if permissions.mode() & 0o111 != 0o111 {
-			permissions.set_mode(0o755);
-			fs::set_permissions(&loader, permissions)
-				.map_err(|e| format!("setting the mode of {LOADER_PATH}: {e}"))?;
-			if !installer.changed.contains(&LOADER_PATH) {
-				installer.changed.push(LOADER_PATH);
-			}
-		}
+		installer.write_plan(&plan, LOADER_PATH)?;
 		if hard_linked
 			&& installer.changed.contains(&"AGENTS.md")
 			&& !installer.changed.contains(&"CLAUDE.md")

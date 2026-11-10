@@ -48,6 +48,9 @@ start of every session in every adopting repository:
   - With a stale cache (no successful fetch recorded in the last 7 days) it fetches before serving,
     bounded by the 4 s watchdog.
 
+These invariants apply to user mode (`load.sh claude user`, run from `~/.claude/agent-guidance/`)
+too, including the early exit when the project has its own loader hook.
+
 When changing the loader:
 
 - Bump `LOADER_VERSION` in `load.sh` and the `loader-version` file together. A test enforces this.
