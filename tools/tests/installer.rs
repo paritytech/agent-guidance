@@ -43,10 +43,30 @@ struct Repo {
 
 impl Repo {
 	fn new() -> Repo {
+		let repo = Repo::empty();
+		git(&repo.root, &["init", "-q", "-b", "main"]);
+		repo
+	}
+
+	/// An empty directory that is not a git repository, such as a home directory.
+	fn empty() -> Repo {
 		let dir = tempdir();
 		let root = dir.path().to_owned();
-		git(&root, &["init", "-q", "-b", "main"]);
 		Repo { _dir: dir, root }
+	}
+
+	/// Runs `agent-guidance-install --user` with the root as `HOME`, from the directory `cwd`.
+	fn install_user_from(&self, cwd: &Path) -> Output {
+		isolate(Command::new(INSTALLER).arg("--user"))
+			.env("HOME", &self.root)
+			.current_dir(cwd)
+			.output()
+			.expect("running the installer")
+	}
+
+	/// Runs `agent-guidance-install --user` with the root as `HOME`.
+	fn install_user(&self) -> Output {
+		self.install_user_from(&self.root)
 	}
 
 	fn write(&self, path: &str, contents: &str) {
@@ -1282,4 +1302,344 @@ fn leaves_a_loader_group_with_an_http_hook_untouched() {
 #[test]
 fn leaves_a_chained_loader_command_untouched() {
 	assert_mixed_entries_untouched(|entry| chain(&entry, " && notify-me"));
+}
+
+/// The user-level loader, relative to `HOME`.
+const USER_LOADER: &str = ".claude/agent-guidance/load.sh";
+/// The user-level Claude Code settings, relative to `HOME`.
+const USER_SETTINGS: &str = ".claude/settings.json";
+/// The template of the user settings, relative to the templates directory.
+const USER_TEMPLATE: &str = "user/.claude/settings.json";
+
+fn assert_success(output: &Output) {
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+}
+
+/// Asserts that the user loader matches the template with mode 755 and that the settings hold
+/// exactly one user loader entry.
+fn assert_user_installed(home: &Repo) {
+	assert_eq!(home.read(USER_LOADER), template(LOADER));
+	let mode = fs::metadata(home.root.join(USER_LOADER))
+		.expect("the loader exists")
+		.permissions();
+	assert_eq!(mode.mode() & 0o777, 0o755);
+	let entries = home.json(USER_SETTINGS)["hooks"]["SessionStart"]
+		.as_array()
+		.expect("an array of hook entries")
+		.iter()
+		.filter(|entry| entry.to_string().contains(USER_LOADER))
+		.cloned()
+		.collect::<Vec<_>>();
+	assert_eq!(entries, [template_entry(USER_TEMPLATE, "SessionStart")]);
+}
+
+/// Runs the user install again and asserts that nothing changes.
+fn assert_second_user_run_changes_nothing(home: &Repo) {
+	let files = home.snapshot();
+	let output = home.install_user();
+	assert_success(&output);
+	assert_eq!(
+		stdout(&output),
+		format!("{}Nothing to change.\n", current())
+	);
+	assert_eq!(home.snapshot(), files);
+}
+
+#[test]
+fn user_install_writes_the_loader_and_the_hook() {
+	let home = Repo::empty();
+	let output = home.install_user();
+	assert_success(&output);
+	assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+	assert_eq!(
+		stdout(&output),
+		format!(
+			"loader ? -> v{}\nChanged files:\n  ~/{USER_LOADER}\n  ~/{USER_SETTINGS}\n",
+			version()
+		)
+	);
+	assert_eq!(home.read(USER_SETTINGS), template(USER_TEMPLATE));
+	assert_user_installed(&home);
+	let files: Vec<PathBuf> = home.snapshot().into_keys().collect();
+	assert_eq!(files, [Path::new(USER_LOADER), Path::new(USER_SETTINGS)]);
+	assert_second_user_run_changes_nothing(&home);
+}
+
+/// A user install run from inside a repository writes nothing there.
+#[test]
+fn user_install_touches_no_repository() {
+	let repo = Repo::new();
+	let home = Repo::empty();
+	let output = home.install_user_from(&repo.root);
+	assert_success(&output);
+	assert!(!stdout(&output).contains("git add"), "{}", stdout(&output));
+	assert!(repo.snapshot().is_empty());
+	assert_eq!(repo.status(), "");
+	assert_user_installed(&home);
+}
+
+#[test]
+fn user_install_keeps_other_settings_and_hooks() {
+	let home = Repo::empty();
+	let repository_entry = template_entry(".claude/settings.json", "SessionStart");
+	let other = serde_json::json!({"hooks": [{"type": "command", "command": "echo hello"}]});
+	let settings = serde_json::json!({
+		"permissions": {"allow": ["Bash(make)"]},
+		"hooks": {
+			"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "check"}]}],
+			"SessionStart": [other, repository_entry]
+		},
+		"model": "x"
+	});
+	home.write(USER_SETTINGS, &settings.to_string());
+	let output = home.install_user();
+	assert_success(&output);
+	assert_user_installed(&home);
+	let after = home.json(USER_SETTINGS);
+	let keys: Vec<&String> = after.as_object().expect("an object").keys().collect();
+	assert_eq!(keys, ["permissions", "hooks", "model"]);
+	assert_eq!(after["permissions"], settings["permissions"]);
+	assert_eq!(after["model"], "x");
+	assert_eq!(
+		after["hooks"]["PreToolUse"],
+		settings["hooks"]["PreToolUse"]
+	);
+	assert_eq!(
+		after["hooks"]["SessionStart"],
+		Value::Array(vec![
+			settings["hooks"]["SessionStart"][0].clone(),
+			settings["hooks"]["SessionStart"][1].clone(),
+			template_entry(USER_TEMPLATE, "SessionStart"),
+		])
+	);
+	assert_second_user_run_changes_nothing(&home);
+}
+
+#[test]
+fn user_install_updates_an_outdated_entry() {
+	let home = Repo::empty();
+	let entry = template_entry(USER_TEMPLATE, "SessionStart");
+	let before = rewrite(&entry, "command", &Value::from("before"));
+	let after = rewrite(&entry, "command", &Value::from("after"));
+	let outdated = rewrite(&entry, "timeout", &Value::from(1));
+	home.write(
+		USER_SETTINGS,
+		&config_with("SessionStart", &[before.clone(), outdated, after.clone()]),
+	);
+	let output = home.install_user();
+	assert_success(&output);
+	assert!(stdout(&output).contains(&format!("  ~/{USER_SETTINGS}\n")));
+	let config = home.json(USER_SETTINGS);
+	assert_eq!(
+		config["hooks"]["SessionStart"],
+		Value::Array(vec![before, entry, after])
+	);
+	assert_eq!(config["model"], "x");
+	assert_second_user_run_changes_nothing(&home);
+}
+
+#[test]
+fn user_install_writes_nothing_over_a_newer_loader() {
+	let home = Repo::empty();
+	let newer = version() + 1;
+	home.write(USER_LOADER, &loader_with_version(&newer.to_string()));
+	fs::set_permissions(
+		home.root.join(USER_LOADER),
+		fs::Permissions::from_mode(0o755),
+	)
+	.expect("setting the mode");
+	let outdated = rewrite(
+		&template_entry(USER_TEMPLATE, "SessionStart"),
+		"timeout",
+		&Value::from(1),
+	);
+	home.write(USER_SETTINGS, &config_with("SessionStart", &[outdated]));
+	let files = home.snapshot();
+	let output = home.install_user();
+	assert_eq!(output.status.code(), Some(1));
+	assert_eq!(
+		String::from_utf8_lossy(&output.stderr),
+		format!(
+			"error: ~/{USER_LOADER} is loader v{newer}, newer than v{} from this installer.\n\
+			 No file was changed. Update the installer and run it again:\n  \
+			 cargo install --git https://github.com/paritytech/agent-guidance\n",
+			version()
+		)
+	);
+	assert_eq!(stdout(&output), "");
+	assert_eq!(home.snapshot(), files);
+}
+
+#[test]
+fn user_install_rejects_a_root() {
+	let repo = Repo::new();
+	let home = Repo::empty();
+	for args in [["--user", "."], [".", "--user"]] {
+		let output = isolate(Command::new(INSTALLER).args(args))
+			.env("HOME", &home.root)
+			.current_dir(&repo.root)
+			.output()
+			.expect("running the installer");
+		assert_eq!(output.status.code(), Some(2), "{args:?}");
+		assert!(
+			String::from_utf8_lossy(&output.stderr)
+				.starts_with("error: --user takes no other argument\n"),
+			"{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+	assert!(home.snapshot().is_empty());
+	assert!(repo.snapshot().is_empty());
+}
+
+#[test]
+fn user_install_requires_home() {
+	let dir = tempdir();
+	for home in [None, Some("")] {
+		let mut command = Command::new(INSTALLER);
+		isolate(&mut command).arg("--user").current_dir(dir.path());
+		match home {
+			Some(home) => command.env("HOME", home),
+			None => command.env_remove("HOME"),
+		};
+		let output = command.output().expect("running the installer");
+		assert_eq!(output.status.code(), Some(2), "{home:?}");
+		assert_eq!(
+			String::from_utf8_lossy(&output.stderr),
+			"error: HOME is not set; --user installs into $HOME/.claude\n"
+		);
+	}
+	assert_eq!(fs::read_dir(dir.path()).expect("reading").count(), 0);
+}
+
+#[test]
+fn user_install_requires_home_to_be_a_directory() {
+	let dir = tempdir();
+	let home = dir.path().join("home");
+	fs::write(&home, "a file\n").expect("writing a file");
+	let output = isolate(Command::new(INSTALLER).arg("--user"))
+		.env("HOME", &home)
+		.current_dir(dir.path())
+		.output()
+		.expect("running the installer");
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(
+		String::from_utf8_lossy(&output.stderr),
+		format!("error: HOME ({}) is not a directory\n", home.display())
+	);
+	assert_eq!(stdout(&output), "");
+	assert_eq!(fs::read_to_string(&home).expect("reading"), "a file\n");
+	assert_eq!(fs::read_dir(dir.path()).expect("reading").count(), 1);
+}
+
+/// Runs the user install over settings `{"model": "x"}` at `target`, relative to `HOME`, which a
+/// link reaches, and asserts that the target holds the merged settings and that `link` still
+/// points to `to`.
+fn assert_user_writes_through(home: &Repo, target: &str, link: &str, to: &str) {
+	let output = home.install_user();
+	assert_success(&output);
+	assert_eq!(
+		fs::read_link(home.root.join(link)).expect("the link stays"),
+		Path::new(to)
+	);
+	let settings = home.json(target);
+	assert_eq!(settings["model"], "x");
+	assert_eq!(
+		settings["hooks"]["SessionStart"],
+		Value::Array(vec![template_entry(USER_TEMPLATE, "SessionStart")])
+	);
+	assert_user_installed(home);
+	assert_second_user_run_changes_nothing(home);
+}
+
+/// A `~/.claude` kept in a dotfiles repository is written through.
+#[test]
+fn user_install_writes_through_a_linked_claude_directory() {
+	let home = Repo::empty();
+	home.write("dotfiles/claude/settings.json", "{\"model\": \"x\"}\n");
+	home.symlink("dotfiles/claude", ".claude");
+	assert_user_writes_through(
+		&home,
+		"dotfiles/claude/settings.json",
+		".claude",
+		"dotfiles/claude",
+	);
+	assert_eq!(
+		home.read("dotfiles/claude/agent-guidance/load.sh"),
+		template(LOADER)
+	);
+}
+
+/// A linked `~/.claude/settings.json` and a linked `~/.claude/agent-guidance` are written
+/// through.
+#[test]
+fn user_install_writes_through_linked_files() {
+	let home = Repo::empty();
+	home.write("dotfiles/settings.json", "{\"model\": \"x\"}\n");
+	fs::create_dir(home.root.join(".claude")).expect("creating .claude");
+	home.symlink("../dotfiles/settings.json", USER_SETTINGS);
+	assert_user_writes_through(
+		&home,
+		"dotfiles/settings.json",
+		USER_SETTINGS,
+		"../dotfiles/settings.json",
+	);
+
+	let home = Repo::empty();
+	home.write("dotfiles/settings.json", "{\"model\": \"x\"}\n");
+	fs::create_dir(home.root.join("shared")).expect("creating a directory");
+	fs::create_dir(home.root.join(".claude")).expect("creating .claude");
+	home.symlink("../dotfiles/settings.json", USER_SETTINGS);
+	home.symlink("../shared", ".claude/agent-guidance");
+	assert_user_writes_through(
+		&home,
+		"dotfiles/settings.json",
+		".claude/agent-guidance",
+		"../shared",
+	);
+	assert_eq!(home.read("shared/load.sh"), template(LOADER));
+
+	// A linked loader that lost its executable bit gets it back on its target.
+	let home = Repo::empty();
+	home.write("dotfiles/settings.json", "{\"model\": \"x\"}\n");
+	home.write("shared/load.sh", &template(LOADER));
+	fs::create_dir_all(home.root.join(".claude/agent-guidance")).expect("creating a directory");
+	home.symlink("../dotfiles/settings.json", USER_SETTINGS);
+	home.symlink("../../shared/load.sh", USER_LOADER);
+	assert_user_writes_through(
+		&home,
+		"dotfiles/settings.json",
+		USER_LOADER,
+		"../../shared/load.sh",
+	);
+}
+
+/// Settings the installer cannot merge are left unchanged and reported with the template.
+#[test]
+fn user_install_leaves_unmergeable_settings_untouched() {
+	let entry = template_entry(USER_TEMPLATE, "SessionStart");
+	for (settings, error) in [
+		("{ \"hooks\": [ }\n".to_owned(), "not valid JSON"),
+		(
+			config_with("SessionStart", &[chain(&entry, " && notify-me")]),
+			"an entry in `hooks.SessionStart` runs more than the loader",
+		),
+	] {
+		let home = Repo::empty();
+		home.write(USER_SETTINGS, &settings);
+		let output = home.install_user();
+		assert_eq!(output.status.code(), Some(1), "{settings}");
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		assert!(
+			stderr.contains(&format!("error: ~/{USER_SETTINGS}: {error}")),
+			"{stderr}"
+		);
+		assert!(stderr.contains(&template(USER_TEMPLATE)), "{stderr}");
+		assert_eq!(home.read(USER_SETTINGS), settings);
+		assert_eq!(home.read(USER_LOADER), template(LOADER));
+	}
 }

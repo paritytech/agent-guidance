@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME\"/.claude/agent-guidance/load.sh claude user",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
