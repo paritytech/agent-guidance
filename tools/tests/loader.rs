@@ -38,6 +38,18 @@ const FALLBACK: &str = "Company agent guidance could not be fetched for this ses
 /// The steps the out-of-date notice tells the user to take.
 const UPGRADE: &str = "run cargo install --git https://github.com/paritytech/agent-guidance, \
 	then agent-guidance-install, and commit";
+/// The steps the out-of-date notice tells the user to take in user mode.
+const USER_UPGRADE: &str = "run cargo install --git https://github.com/paritytech/agent-guidance, \
+	then agent-guidance-install --user";
+/// The context in user mode when nothing can be served.
+const USER_FALLBACK: &str = "Company agent guidance could not be fetched for this session.";
+/// The whole stdout of a user-mode run in a repository that has its own loader hook.
+const USER_SKIPPED: &str = "{\"systemMessage\":\"parity-agent-guidance (user): skipped, this repository loads its own\"}\n";
+/// The repository's Claude Code hook config, which runs the repository loader.
+const REPO_HOOK: &str = concat!(
+	env!("CARGO_MANIFEST_DIR"),
+	"/templates/.claude/settings.json"
+);
 
 /// Upper bound for a loader run against a network that accepts connections and never answers.
 const HUNG_BUDGET: Duration = Duration::from_secs(6);
@@ -111,6 +123,16 @@ loader_tests!(
 	force_pushed_remote_updates_the_cache,
 	relative_invocation_from_the_root,
 	background_fetch_times_out,
+	unknown_mode_runs_in_repository_mode,
+	user_mode_loads,
+	user_mode_skips_a_repository_with_its_own_hook,
+	user_mode_falls_back_to_the_working_directory,
+	user_mode_stale_loader_notice,
+	user_mode_without_cache,
+	user_mode_ignores_a_permission_for_the_loader,
+	user_mode_cache_without_guidance,
+	user_mode_handles_spaces_in_paths,
+	repository_mode_ignores_the_project_hook,
 );
 
 /// Finds `name` in the directories of `PATH`.
@@ -190,12 +212,18 @@ impl StalledServer {
 }
 
 /// A guidance remote and a downstream repository root with the loader installed.
+///
+/// In user mode the root is the directory of a user-level loader,
+/// `<home>/.claude/agent-guidance`, and runs pass `user` after the harness. `CLAUDE_PROJECT_DIR`
+/// then names `project`, an empty directory.
 struct Fixture {
 	_dir: TempDir,
 	base: PathBuf,
 	work: PathBuf,
 	remote: PathBuf,
 	root: PathBuf,
+	user: bool,
+	project: PathBuf,
 }
 
 impl Fixture {
@@ -203,24 +231,43 @@ impl Fixture {
 	///
 	/// The remote also holds this repository's `loader-version`.
 	fn new(guidance: &[u8]) -> Fixture {
+		Fixture::create(guidance, None, "project")
+	}
+
+	/// Like [`Fixture::new`], with the loader installed for the user instead of a repository.
+	fn user(guidance: &[u8]) -> Fixture {
+		Fixture::create(guidance, Some("home"), "project")
+	}
+
+	/// Creates the fixture, in user mode when `home` names the home directory below the base
+	/// directory. `project` names the project directory there.
+	fn create(guidance: &[u8], home: Option<&str>, project: &str) -> Fixture {
 		let dir = tempdir();
 		let base = fs::canonicalize(dir.path()).expect("canonicalizing the temporary directory");
+		let root = match home {
+			Some(home) => base.join(home).join(".claude/agent-guidance"),
+			None => base.join("downstream"),
+		};
 		let fixture = Fixture {
 			_dir: dir,
 			work: base.join("work"),
 			remote: base.join("remote.git"),
-			root: base.join("downstream"),
+			project: base.join(project),
+			root,
+			user: home.is_some(),
 			base,
 		};
 		fs::create_dir(&fixture.work).expect("creating the work repository");
+		fs::create_dir(&fixture.project).expect("creating the project directory");
 		git(&fixture.work, &["init", "-q", "-b", "main"]);
 		git(
 			&fixture.base,
 			&["init", "-q", "--bare", "-b", "main", "remote.git"],
 		);
-		fs::create_dir_all(fixture.root.join(".agent-guidance-loader"))
+		let loader = fixture.loader();
+		fs::create_dir_all(loader.parent().expect("the loader has a parent"))
 			.expect("creating the downstream root");
-		fs::copy(LOADER, fixture.loader()).expect("copying the loader");
+		fs::copy(LOADER, loader).expect("copying the loader");
 		let version = fs::read(format!("{REPO}/loader-version")).expect("reading loader-version");
 		fixture.publish(&[("GUIDANCE.md", guidance), ("loader-version", &version)]);
 		fixture
@@ -245,7 +292,11 @@ impl Fixture {
 	}
 
 	fn loader(&self) -> PathBuf {
-		self.root.join(".agent-guidance-loader/load.sh")
+		if self.user {
+			self.root.join("load.sh")
+		} else {
+			self.root.join(".agent-guidance-loader/load.sh")
+		}
 	}
 
 	fn url(&self) -> String {
@@ -299,10 +350,18 @@ impl Fixture {
 		let body = guidance
 			.strip_suffix('\n')
 			.expect("guidance ends with a newline");
-		format!(
-			"Company agent guidance follows. Files it links to live under `{}/`.\n\n{body}",
-			self.cache().display()
-		)
+		let cache = self.cache();
+		let cache = cache.display();
+		if self.user {
+			format!(
+				"Company agent guidance follows. Paths below that start with `.agent-guidance/` \
+				 refer to `{cache}/`.\n\n{body}"
+			)
+		} else {
+			format!(
+				"Company agent guidance follows. Files it links to live under `{cache}/`.\n\n{body}"
+			)
+		}
 	}
 
 	/// The abbreviated commit the cache has checked out, as the status line shows it.
@@ -328,6 +387,8 @@ impl Fixture {
 		isolate(&mut command)
 			.arg(script)
 			.args(harness)
+			.args(self.user.then_some("user"))
+			.env("CLAUDE_PROJECT_DIR", &self.project)
 			.env("AGENT_GUIDANCE_URL", url)
 			.env("GIT_CONFIG_COUNT", "1")
 			.env("GIT_CONFIG_KEY_0", "protocol.ext.allow")
@@ -381,10 +442,12 @@ impl Fixture {
 
 	/// Asserts that no temporary clone and no git lock file was left behind.
 	fn assert_clean(&self) {
-		assert_eq!(
-			entries(&self.root),
-			[".agent-guidance", ".agent-guidance-loader"]
-		);
+		let loader = if self.user {
+			"load.sh"
+		} else {
+			".agent-guidance-loader"
+		};
+		assert_eq!(entries(&self.root), [".agent-guidance", loader]);
 		let mut pending = vec![self.cache()];
 		while let Some(dir) = pending.pop() {
 			for entry in fs::read_dir(dir).expect("reading the cache") {
@@ -461,6 +524,27 @@ impl Run {
 			.as_str()
 			.expect("the status line is a string")
 			.to_owned()
+	}
+
+	/// Checks that a user-mode run skipped the repository: it exits 0 and prints one JSON object
+	/// whose only key is `systemMessage`, with no context.
+	fn assert_skipped(&self) {
+		let stderr = String::from_utf8_lossy(&self.output.stderr);
+		assert!(
+			self.output.status.success(),
+			"exit status {}: {stderr}",
+			self.output.status
+		);
+		let stdout = std::str::from_utf8(&self.output.stdout).expect("stdout is UTF-8");
+		let output: Value = serde_json::from_str(stdout).expect("stdout is one JSON object");
+		let keys: Vec<&str> = output
+			.as_object()
+			.expect("stdout is a JSON object")
+			.keys()
+			.map(String::as_str)
+			.collect();
+		assert_eq!(keys, ["systemMessage"]);
+		assert_eq!(stdout, USER_SKIPPED);
 	}
 }
 
@@ -1301,6 +1385,302 @@ fn unapplied_fetch_is_reported(bash: &Path) {
 	let run = fixture.run(bash, &fixture.url(), None);
 	assert_eq!(run.context(None), fixture.context(UPDATED));
 	fixture.assert_cache_matches_remote();
+	fixture.assert_clean();
+}
+
+/// An unknown second argument leaves the output of repository mode unchanged and is reported on
+/// stderr.
+fn unknown_mode_runs_in_repository_mode(bash: &Path) {
+	let guidance = format!("{MARKER}\n");
+	let fixture = Fixture::new(guidance.as_bytes());
+	let output = fixture
+		.command(bash, &fixture.url(), Some("claude"))
+		.arg("bogus")
+		.output()
+		.expect("running the loader");
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("agent-guidance: unknown mode 'bogus', running in repository mode"),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	let run = Run {
+		output,
+		elapsed: Duration::ZERO,
+	};
+	assert_eq!(run.context(Some("claude")), fixture.context(&guidance));
+	assert_eq!(
+		run.system_message(),
+		format!(
+			"parity-agent-guidance: loaded {} (cloned)",
+			fixture.short_head()
+		)
+	);
+	fixture.assert_clean();
+}
+
+/// A user-level loader keeps its cache next to itself and labels its status line. It loads in a
+/// project whose settings lack the repository loader or that has no settings.
+fn user_mode_loads(bash: &Path) {
+	let guidance = format!("{MARKER}\n");
+	let fixture = Fixture::user(guidance.as_bytes());
+	let first = fixture.run(bash, &fixture.url(), Some("claude"));
+	assert_eq!(first.context(Some("claude")), fixture.context(&guidance));
+	fixture.assert_cache_matches_remote();
+	let head = fixture.short_head();
+	assert_eq!(
+		first.system_message(),
+		format!("parity-agent-guidance (user): loaded {head} (cloned)")
+	);
+	let settings = fixture.project.join(".claude/settings.json");
+	fs::create_dir_all(settings.parent().expect("a parent")).expect("creating .claude");
+	fs::write(
+		&settings,
+		r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo hi"}]}]}}"#,
+	)
+	.expect("writing settings");
+	let run = fixture.run(bash, &fixture.url(), Some("claude"));
+	assert_eq!(run.context(Some("claude")), fixture.context(&guidance));
+	assert_eq!(
+		run.system_message(),
+		format!("parity-agent-guidance (user): loaded {head} (cached)")
+	);
+	fixture.assert_clean();
+}
+
+/// A project whose `.claude/settings.json` runs the repository loader gets nothing from the user
+/// hook but the status line, and the user hook runs no git.
+fn user_mode_skips_a_repository_with_its_own_hook(bash: &Path) {
+	let fixture = Fixture::user(format!("{MARKER}\n").as_bytes());
+	let settings = fixture.project.join(".claude/settings.json");
+	fs::create_dir_all(settings.parent().expect("a parent")).expect("creating .claude");
+	fs::copy(REPO_HOOK, &settings).expect("copying the repository hook config");
+	let run = fixture.run_once(bash, &fixture.url(), Some("claude"));
+	run.assert_skipped();
+	assert_eq!(String::from_utf8_lossy(&run.output.stderr), "");
+	assert_eq!(entries(&fixture.root), ["load.sh"]);
+}
+
+/// Without `CLAUDE_PROJECT_DIR` the project is the working directory.
+fn user_mode_falls_back_to_the_working_directory(bash: &Path) {
+	let guidance = format!("{MARKER}\n");
+	let fixture = Fixture::user(guidance.as_bytes());
+	let with_hook = fixture.base.join("with-hook");
+	fs::create_dir_all(with_hook.join(".claude")).expect("creating .claude");
+	fs::copy(REPO_HOOK, with_hook.join(".claude/settings.json"))
+		.expect("copying the repository hook config");
+	// CLAUDE_PROJECT_DIR names a directory with the repository hook; unset, the working directory
+	// decides.
+	let run_in = |dir: &Path| {
+		let output = fixture
+			.command(bash, &fixture.url(), Some("claude"))
+			.env_remove("CLAUDE_PROJECT_DIR")
+			.current_dir(dir)
+			.output()
+			.expect("running the loader");
+		Run {
+			output,
+			elapsed: Duration::ZERO,
+		}
+	};
+	run_in(&with_hook).assert_skipped();
+	assert_eq!(entries(&fixture.root), ["load.sh"]);
+	let run = run_in(&fixture.project);
+	assert_eq!(run.context(Some("claude")), fixture.context(&guidance));
+
+	// And CLAUDE_PROJECT_DIR wins over the working directory.
+	let output = fixture
+		.command(bash, &fixture.url(), Some("claude"))
+		.env("CLAUDE_PROJECT_DIR", &with_hook)
+		.current_dir(&fixture.project)
+		.output()
+		.expect("running the loader");
+	Run {
+		output,
+		elapsed: Duration::ZERO,
+	}
+	.assert_skipped();
+}
+
+/// The out-of-date notice in user mode names `agent-guidance-install --user` and nothing to
+/// commit.
+fn user_mode_stale_loader_notice(bash: &Path) {
+	let guidance = format!("{MARKER}\n");
+	let fixture = Fixture::user(guidance.as_bytes());
+	fixture
+		.run(bash, &fixture.url(), Some("claude"))
+		.context(Some("claude"));
+	let loader: u32 = fs::read_to_string(format!("{REPO}/loader-version"))
+		.expect("reading loader-version")
+		.trim_end()
+		.parse()
+		.expect("loader-version holds an integer");
+	let latest = loader + 1;
+	fixture.publish(&[("loader-version", format!("{latest}\n").as_bytes())]);
+	let run = fixture.run_updated(bash, Some("claude"));
+	assert_eq!(run.context(Some("claude")), fixture.context(&guidance));
+	assert_eq!(
+		run.system_message(),
+		format!(
+			"parity-agent-guidance (user): loaded {} (fetched); loader v{loader} out of date \
+			 (v{latest} available): {USER_UPGRADE}",
+			fixture.short_head()
+		)
+	);
+}
+
+/// Without a cache the user-mode context says so and points to no repository file.
+fn user_mode_without_cache(bash: &Path) {
+	let fixture = Fixture::user(format!("{MARKER}\n").as_bytes());
+	let run = fixture.run(bash, OFFLINE, Some("claude"));
+	assert_eq!(run.context(Some("claude")), USER_FALLBACK);
+	assert_eq!(
+		run.system_message(),
+		format!("parity-agent-guidance (user): NOT loaded, could not clone {OFFLINE}")
+	);
+	assert_eq!(entries(&fixture.root), ["load.sh"]);
+}
+
+/// Writes `contents` to the project's `.claude/settings.json`.
+fn write_project_settings(fixture: &Fixture, contents: &[u8]) {
+	let settings = fixture.project.join(".claude/settings.json");
+	fs::create_dir_all(settings.parent().expect("a parent")).expect("creating .claude");
+	fs::write(settings, contents).expect("writing the project settings");
+}
+
+/// A permission rule that names the repository loader is not a hook that runs it.
+fn user_mode_ignores_a_permission_for_the_loader(bash: &Path) {
+	let guidance = format!("{MARKER}\n");
+	let fixture = Fixture::user(guidance.as_bytes());
+	write_project_settings(
+		&fixture,
+		br#"{"permissions": {"allow": ["Bash(.agent-guidance-loader/load.sh:*)"]}}"#,
+	);
+	let run = fixture.run(bash, &fixture.url(), Some("claude"));
+	assert_eq!(run.context(Some("claude")), fixture.context(&guidance));
+	assert_eq!(
+		run.system_message(),
+		format!(
+			"parity-agent-guidance (user): loaded {} (cloned)",
+			fixture.short_head()
+		)
+	);
+}
+
+/// In user mode the status line names the user cache, not a repository's `.agent-guidance/`.
+fn user_mode_cache_without_guidance(bash: &Path) {
+	let fixture = Fixture::user(format!("{MARKER}\n").as_bytes());
+	fixture
+		.run(bash, &fixture.url(), Some("claude"))
+		.context(Some("claude"));
+	fs::remove_file(fixture.work.join("GUIDANCE.md")).expect("removing GUIDANCE.md");
+	fixture.push();
+	let cache = fixture.cache();
+	let cache = cache.display();
+
+	let run = fixture.run_updated(bash, Some("claude"));
+	assert_eq!(run.context(Some("claude")), USER_FALLBACK);
+	assert_eq!(
+		run.system_message(),
+		format!("parity-agent-guidance (user): NOT loaded, no usable copy in {cache}/")
+	);
+
+	fixture.age_marker(EXPIRED);
+	let run = fixture.run_once(bash, OFFLINE, Some("claude"));
+	assert_eq!(run.context(Some("claude")), USER_FALLBACK);
+	assert_eq!(
+		run.system_message(),
+		format!(
+			"parity-agent-guidance (user): NOT loaded, fetch failed, no usable copy in {cache}/"
+		)
+	);
+}
+
+/// The user hook command works with spaces in the home and project paths, run the way Claude
+/// Code runs it: through a shell, with `HOME` and `CLAUDE_PROJECT_DIR` set.
+fn user_mode_handles_spaces_in_paths(bash: &Path) {
+	let guidance = format!("{MARKER}\n");
+	let fixture = Fixture::create(guidance.as_bytes(), Some("my home"), "my project");
+	let home = fixture.base.join("my home");
+	let hook = || {
+		let mut command = Command::new(bash);
+		isolate(&mut command)
+			.args(["-c", "\"$HOME\"/.claude/agent-guidance/load.sh claude user"])
+			.env("HOME", &home)
+			.env("CLAUDE_PROJECT_DIR", &fixture.project)
+			.env("AGENT_GUIDANCE_URL", fixture.url())
+			.stdin(Stdio::null())
+			.output()
+			.expect("running the hook command")
+	};
+	let run = Run {
+		output: hook(),
+		elapsed: Duration::ZERO,
+	};
+	assert_eq!(run.context(Some("claude")), fixture.context(&guidance));
+	assert_eq!(
+		run.system_message(),
+		format!(
+			"parity-agent-guidance (user): loaded {} (cloned)",
+			fixture.short_head()
+		)
+	);
+	assert!(
+		fixture
+			.cache()
+			.starts_with(fixture.base.join("my home/.claude"))
+	);
+	fixture.assert_cache_matches_remote();
+
+	write_project_settings(
+		&fixture,
+		&fs::read(REPO_HOOK).expect("reading the hook config"),
+	);
+	Run {
+		output: hook(),
+		elapsed: Duration::ZERO,
+	}
+	.assert_skipped();
+}
+
+/// Only user mode looks at the project's settings: repository mode, also after an unknown mode
+/// argument, loads in a project that has its own hook.
+fn repository_mode_ignores_the_project_hook(bash: &Path) {
+	let guidance = format!("{MARKER}\n");
+	let fixture = Fixture::new(guidance.as_bytes());
+	write_project_settings(
+		&fixture,
+		&fs::read(REPO_HOOK).expect("reading the hook config"),
+	);
+	for mode in [None, Some("bogus")] {
+		// The second run serves the cache and fetches in the background.
+		let since = fixture
+			.marker()
+			.is_file()
+			.then(|| fixture.age_marker(RECENT));
+		let output = fixture
+			.command(bash, &fixture.url(), Some("claude"))
+			.args(mode)
+			.output()
+			.expect("running the loader");
+		let run = Run {
+			output,
+			elapsed: Duration::ZERO,
+		};
+		assert_eq!(
+			run.context(Some("claude")),
+			fixture.context(&guidance),
+			"{mode:?}"
+		);
+		assert!(
+			run.system_message()
+				.starts_with("parity-agent-guidance: loaded "),
+			"{mode:?}"
+		);
+		if let Some(since) = since {
+			fixture.wait_for_fetch(since);
+		}
+	}
 	fixture.assert_clean();
 }
 

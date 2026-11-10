@@ -25,8 +25,8 @@ A worker knows only what the brief says. Include:
 - The files or responsibilities it owns, the worktree path and branch, and the base commit.
 - The full `AGENTS.md` and `CLAUDE.md` files on the touched paths, by path, to read in full. Do not
   pass a selection of rules: briefs with picked rules miss requirements.
-- The shell rules from `.agent-guidance/guidance/shell.md` when the session runs with a permission
-  checker.
+- The shell rules from `.agent-guidance/guidance/shell.md` when the worker's harness asks the
+  user about, or denies, a shell command that no allow rule matches.
 - Where scratch files and evidence go (inside the repository, under an ignored directory).
 - Acceptance criteria: the tests and checks to run, and what counts as done.
 - The report format: changes or findings, validation evidence with commands and results, open
