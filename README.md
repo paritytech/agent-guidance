@@ -106,6 +106,21 @@ Hooks run only in a trusted workspace. Details are in [docs/harnesses.md](docs/h
   - `.agent-guidance/guidance/writing.md`: read when writing PR text, commits, issues, review
     comments, docs, code comments or replies to the user.
 
+## Hivemind
+
+Collective memory serves us best if it is continuously updated.
+
+Hivemind is a skill that finds what to change in the guidance from your own agent sessions. Run it
+now and then from this checkout: `/hivemind` in Claude Code or `$hivemind` in Codex.
+
+- It reads your local Claude Code and Codex sessions that loaded the guidance.
+- It looks for guidance bugs, contradictions, ignored rules and corrections you had to repeat.
+- It leaves out personal preferences and repository-specific rules, and says where they belong
+  instead.
+- It reports the findings and opens a PR only for the ones you pick.
+
+The skill lives in `.agents/skills/hivemind/`, with a symlink in `.claude/skills/` for Claude Code.
+
 ## Development
 
 The installer, its templates and the tests are in `tools/`. Test setup, CI and how to resync the
