@@ -1,7 +1,13 @@
 # Shell
 
-How to run shell commands that a permission checker approves without asking, so unattended runs do
-not stop for approval. Pass these rules on in every worker brief.
+How to write shell commands that allow rules match, so the harness neither asks the user nor
+denies them.
+
+- "Keep each call simple" and the first two bullets of "Files" apply when the harness asks the
+  user about, or denies, a shell command that no allow rule matches. Skip them while it approves
+  such commands itself, such as Claude Code in auto mode.
+- The rest applies to every shell command.
+- Pass these rules on in the brief of every worker whose harness asks or denies.
 
 ## Keep each call simple
 
