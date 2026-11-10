@@ -2,7 +2,7 @@
 #
 # Prints company agent guidance as SessionStart hook output.
 #
-# Usage: load.sh [claude|codex|gemini|cursor|copilot]
+# Usage: load.sh [claude|codex|gemini|cursor|copilot] [user]
 #
 # Clones the guidance repository into <repository root>/.agent-guidance/ and
 # prints its GUIDANCE.md as one JSON object in the shape the named harness
@@ -23,15 +23,22 @@
 # how to upgrade. Cursor and Copilot have no status line, so for them the
 # context asks the agent to tell the user instead.
 #
+# With the second argument `user`, the loader runs from a user-level Claude Code
+# hook (~/.claude/agent-guidance/load.sh claude user) and keeps its cache next
+# to itself instead of in a repository. When the project's .claude/settings.json
+# already runs the repository loader, it injects nothing and prints only a
+# status line, so the guidance is not loaded twice.
+#
 # AGENT_GUIDANCE_URL overrides the repository URL (mirrors, tests).
 # AGENT_GUIDANCE_BACKGROUND_BUDGET overrides the time limit of the background
 # fetch in seconds (tests).
 #
 # Compatible with bash 3.2 (macOS /bin/bash). Needs git and standard utilities
-# (awk, tr, find, touch); uses python3 for JSON escaping when it is available.
+# (awk, tr, find, touch, and grep in user mode); uses python3 for JSON escaping
+# when it is available.
 
 # Must equal the loader-version file at the root of the guidance repository.
-LOADER_VERSION=4
+LOADER_VERSION=5
 
 # fd 3 keeps the real stdout for the JSON object. fd 1 becomes the real stderr,
 # so echo and git output are diagnostics. fd 2 goes to /dev/null: on macOS the
@@ -42,6 +49,30 @@ LOADER_VERSION=4
 exec 3>&1 1>&2 2>/dev/null
 
 harness=${1:-claude}
+user_mode=
+status_prefix='parity-agent-guidance: '
+case ${2-} in
+'') ;;
+user)
+	user_mode=1
+	status_prefix='parity-agent-guidance (user): '
+	;;
+*) echo "agent-guidance: unknown mode '$2', running in repository mode" ;;
+esac
+
+# A repository with its own loader hook gets the guidance from that hook. The
+# check only reads the project's settings, before any git command runs. It
+# matches the hook command, so a permission rule that names the loader path
+# does not count.
+if [ -n "$user_mode" ]; then
+	project=${CLAUDE_PROJECT_DIR:-$PWD}
+	if grep -qF '.agent-guidance-loader/load.sh claude' "$project/.claude/settings.json" </dev/null; then
+		printf '%s\n' \
+			'{"systemMessage":"parity-agent-guidance (user): skipped, this repository loads its own"}' >&3
+		exit 0
+	fi
+fi
+
 url=${AGENT_GUIDANCE_URL:-https://github.com/paritytech/agent-guidance.git}
 # The URL as the status line shows it, without user name and password, which
 # would otherwise reach the user's screen and transcripts. In a URL with a
@@ -78,8 +109,20 @@ esac
 
 # With CDPATH set, cd prints the directory it changed to.
 unset CDPATH
-root=$(cd "$(dirname "$0")/.." && pwd -P)
+# In user mode the cache lives next to the loader, in repository mode in the
+# repository root above .agent-guidance-loader/.
+if [ -n "$user_mode" ]; then
+	root=$(cd "$(dirname "$0")" && pwd -P)
+else
+	root=$(cd "$(dirname "$0")/.." && pwd -P)
+fi
 cache=$root/.agent-guidance
+# The cache as the status line names it.
+if [ -n "$user_mode" ]; then
+	shown_cache=$cache/
+else
+	shown_cache=.agent-guidance/
+fi
 # Touched after every successful fetch or clone.
 marker=$cache/.git/agent-guidance-last-fetch
 background_fetch=
@@ -159,7 +202,10 @@ trap '
 state=
 reason=
 
-if [ -z "$root" ]; then
+if [ -z "$root" ] && [ -n "$user_mode" ]; then
+	reason="cannot locate the loader directory from $0"
+	echo "agent-guidance: $reason"
+elif [ -z "$root" ]; then
 	reason="cannot locate the repository root from $0"
 	echo "agent-guidance: $reason"
 elif ! command -v git >/dev/null; then
@@ -254,7 +300,11 @@ if [ -n "$serve" ]; then
 fi
 # The installer embeds the loader it writes, so it has to be updated first.
 upgrade="run cargo install --git https://github.com/paritytech/agent-guidance"
-upgrade="$upgrade, then agent-guidance-install, and commit"
+if [ -n "$user_mode" ]; then
+	upgrade="$upgrade, then agent-guidance-install --user"
+else
+	upgrade="$upgrade, then agent-guidance-install, and commit"
+fi
 
 # The status line for the user. The commit comes from git's own records in the
 # cache, a local operation like the rev-parse calls above; run_git is not used
@@ -276,20 +326,25 @@ status_line() {
 	elif [ -n "$reason" ]; then
 		message="NOT loaded, $reason"
 	elif [ "$state" = fetch_failed ]; then
-		message="NOT loaded, fetch failed, no usable copy in .agent-guidance/"
+		message="NOT loaded, fetch failed, no usable copy in $shown_cache"
 	else
-		message="NOT loaded, no usable copy in .agent-guidance/"
+		message="NOT loaded, no usable copy in $shown_cache"
 	fi
 	if [ -n "$outdated" ]; then
 		message="$message; loader v$LOADER_VERSION out of date (v$outdated available): $upgrade"
 	fi
-	printf 'parity-agent-guidance: %s\n' "$message"
+	printf '%s%s\n' "$status_prefix" "$message"
 }
 
 context() {
 	if [ -n "$serve" ]; then
-		printf "Company agent guidance follows. Files it links to live under \`%s/\`.\n\n" \
-			"$cache"
+		if [ -n "$user_mode" ]; then
+			printf '%s%s\n\n' "Company agent guidance follows. Paths below that start with" \
+				" \`.agent-guidance/\` refer to \`$cache/\`."
+		else
+			printf "Company agent guidance follows. Files it links to live under \`%s/\`.\n\n" \
+				"$cache"
+		fi
 		cat "$cache/GUIDANCE.md"
 		if [ -n "$outdated" ] && [ -n "$notice_in_context" ]; then
 			printf '\n%s%s%s\n' \
@@ -297,6 +352,8 @@ context() {
 				" $LOADER_VERSION; the current version is $outdated. Tell the user to" \
 				" update it: $upgrade."
 		fi
+	elif [ -n "$user_mode" ]; then
+		printf '%s\n' "Company agent guidance could not be fetched for this session."
 	else
 		printf '%s%s\n' \
 			"Company agent guidance could not be fetched for this session. Follow the" \
