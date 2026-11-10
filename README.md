@@ -42,13 +42,34 @@ agent-guidance-install
 - [docs/installer.md](docs/installer.md) lists every file it writes and how to
   [upgrade the loader](docs/installer.md#upgrading-the-loader).
 
+## Using it in all your repositories
+
+A user-level hook gives you the guidance in Claude Code in every repository you open.
+
+```sh
+cargo install --git https://github.com/paritytech/agent-guidance
+agent-guidance-install --user
+```
+
+- It covers only your own Claude Code sessions.
+- Repositories still need the repository install for other contributors and harnesses.
+- Its status lines start with `parity-agent-guidance (user): `, such as
+  `parity-agent-guidance (user): loaded <sha> (cached)`.
+- In a repository with its own loader hook it injects nothing and shows
+  `parity-agent-guidance (user): skipped, this repository loads its own`.
+- See [User install](docs/installer.md#user-install) and [User mode](docs/loader.md#user-mode).
+
 ## Verify it works
 
 Start a session in Claude Code, Codex or Gemini CLI in a repository with the loader installed.
 
-- A line such as `parity-agent-guidance: loaded <sha> (cached)` appears.
-- A line that does not start with `parity-agent-guidance: loaded` means a problem. The
-  [status line table](docs/loader.md#status-line) lists each line.
+- A line such as `parity-agent-guidance: loaded <sha> (cached)` appears, or
+  `parity-agent-guidance (user): loaded ...` with the
+  [user hook](#using-it-in-all-your-repositories).
+- A line that does not start with `parity-agent-guidance: loaded` or
+  `parity-agent-guidance (user): loaded` means a problem, except the user hook's
+  `skipped, this repository loads its own`. The [status line table](docs/loader.md#status-line)
+  lists each line.
 - Ask the agent "Quote the guidance verification marker."
 - It answers with the `Verification marker:` line from `GUIDANCE.md`.
 - Change the marker here to confirm that an update arrived.

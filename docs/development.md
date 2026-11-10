@@ -6,6 +6,7 @@ the [README](../README.md#development).
 ## Templates and self-install
 
 - The templates in `tools/templates/` mirror the downstream paths.
+  - `tools/templates/user/` holds the user-level hook config, with paths relative to `HOME`.
 - They are embedded into the installer binary.
 - This repository installs its own hook, so agents working on it receive the published guidance
   like any downstream repository.

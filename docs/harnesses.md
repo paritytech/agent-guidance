@@ -15,6 +15,8 @@ harness name as its argument and reads the output shape that harness documents.
 
 - The Claude Code and Codex hooks have no matcher.
 - They run for every session source: startup, resume, clear, compact and fork.
+- The installer sets up a user-level hook only for Claude Code, in `~/.claude/settings.json`. See
+  [User install](installer.md#user-install).
 
 ## Output shapes
 

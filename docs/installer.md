@@ -82,8 +82,8 @@ repository, and leaves committing to the maintainer.
 
 ## Symbolic links
 
-The installer plans every write before it writes anything, and never writes through a symbolic
-link.
+In a repository, the installer plans every write before it writes anything, and never writes
+through a symbolic link. The [user install](#user-install) follows links instead.
 
 - A file counts as written when its planned contents differ from what is on disk. Setting the
   loader's executable bit counts as a write of `load.sh`.
@@ -121,6 +121,38 @@ Commit the changed files it lists. The first line of its output reports the load
   - It checks this before it writes anything, and then writes no file.
   - It prints both versions and the `cargo install` command to stderr, and exits with status 1.
   - A version too large for an integer type counts as newer.
+
+## User install
+
+`agent-guidance-install --user` sets up the guidance for one person's Claude Code sessions in
+every repository. It takes no ROOT and fails when `HOME` is not set or is not a directory.
+
+- It writes `~/.claude/agent-guidance/load.sh` with mode 755, with the same version report and
+  downgrade refusal as in a repository.
+- It merges the user hook entry from `tools/templates/user/.claude/settings.json` into
+  `~/.claude/settings.json`, creating the file when it is missing. The entry runs
+  `"$HOME"/.claude/agent-guidance/load.sh claude user` with a 15 s timeout.
+  - The merge rules and refusals are the ones described above for a repository's
+    `.claude/settings.json`. An entry counts as the user hook when it contains
+    `.claude/agent-guidance/load.sh`; repository loader entries and other hooks are kept.
+- Unlike a repository install, it follows symbolic links below `HOME`. When `~/.claude`,
+  `~/.claude/settings.json`, `~/.claude/agent-guidance` or `load.sh` is a link, for example into
+  a dotfiles repository, it writes the link's target and keeps the link.
+  - When `~/.claude` or `~/.claude/agent-guidance` is a link, the loader keeps its cache in the
+    link's target too. Ignore `.agent-guidance/` and `.agent-guidance.tmp.*/` in the directory
+    that `~/.claude/agent-guidance` resolves to.
+- It writes nothing else: no `.gitignore`, `AGENTS.md`, `CLAUDE.md` or exclude file, and it runs
+  no git. It prints the loader version and the changed files.
+- Repositories still need the repository install for their other contributors and other
+  harnesses. In a repository with its own hook, the user hook only prints a status line (see
+  [User mode](loader.md#user-mode)).
+
+To upgrade the user loader:
+
+```sh
+cargo install --git https://github.com/paritytech/agent-guidance
+agent-guidance-install --user
+```
 
 ## After a run
 

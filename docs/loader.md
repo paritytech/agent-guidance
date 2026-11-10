@@ -1,7 +1,8 @@
 # Loader
 
 The loader is `.agent-guidance-loader/load.sh` in the downstream repository. Each hook config runs
-it with the harness name as its argument: `claude`, `codex`, `gemini`, `cursor` or `copilot`.
+it with the harness name as its argument: `claude`, `codex`, `gemini`, `cursor` or `copilot`. A
+second argument `user` selects [user mode](#user-mode).
 
 ## How it works
 
@@ -99,12 +100,47 @@ field (see [What reaches the user](harnesses.md#what-reaches-the-user)).
   https://github.com/paritytech/agent-guidance, then agent-guidance-install, and commit`.
   - `<N>` is the committed loader's version and `<M>` the fetched `loader-version`.
 - The line is escaped the same way as the context.
+- In [user mode](#user-mode) every line starts with `parity-agent-guidance (user): ` instead.
+  - The "no usable copy" lines name the absolute cache path, such as
+    `/home/me/.claude/agent-guidance/.agent-guidance/`, instead of `.agent-guidance/`.
+  - "No repository root" reads `cannot locate the loader directory from <path>`.
+  - In a repository that has its own loader hook, the only output is the line
+    `parity-agent-guidance (user): skipped, this repository loads its own`.
+
+## User mode
+
+`agent-guidance-install --user` installs the loader for one person's Claude Code sessions in every
+repository (see [User install](installer.md#user-install)). The user hook runs
+`"$HOME"/.claude/agent-guidance/load.sh claude user`.
+
+- The root is the loader's own directory, so the cache is
+  `~/.claude/agent-guidance/.agent-guidance/`. Cloning, fetching, the last-fetch marker and the
+  network limits work as in a repository.
+- Before any git command, the loader reads `.claude/settings.json` in the project directory
+  (`$CLAUDE_PROJECT_DIR`, or the working directory when it is unset).
+  - When that file contains `.agent-guidance-loader/load.sh claude`, the start of the repository
+    hook command, the repository's own hook delivers the guidance. The loader prints only
+    `{"systemMessage":"parity-agent-guidance (user): skipped, this repository loads its own"}`
+    and exits.
+  - Other mentions of the loader path, such as a permission rule
+    `Bash(.agent-guidance-loader/load.sh:*)`, do not count.
+  - The check uses `grep -F` and executes nothing from the file.
+- The context header reads ``Company agent guidance follows. Paths below that start with
+  `.agent-guidance/` refer to `<cache>/`.`` followed by `GUIDANCE.md` unchanged.
+- Without a cache, the context is the single line `Company agent guidance could not be fetched for
+  this session.` It does not point to `AGENTS.md`, since the repository may not have the fallback
+  line.
+- The out-of-date notice ends with `run cargo install --git
+  https://github.com/paritytech/agent-guidance, then agent-guidance-install --user`. There is
+  nothing to commit.
+- Any other second argument runs the loader in repository mode and writes a note to stderr.
 
 ## Requirements
 
 - bash 3.2 or later, so macOS `/bin/bash` works.
 - git.
-- Standard utilities: `awk`, `tr`, `find`, `touch`, `sleep`, `cat`, `mv`, `rm`, `dirname`.
+- Standard utilities: `awk`, `tr`, `find`, `touch`, `sleep`, `cat`, `mv`, `rm`, `dirname`, and
+  `grep` in user mode.
 - `python3 -I` for JSON escaping when available, and awk otherwise. Both produce the same bytes.
 
 ## Loader versions
