@@ -15,10 +15,12 @@ included.
 
 - Before editing in a directory, read the `AGENTS.md` and `CLAUDE.md` files on its path.
 - Follow the repository's build, test and formatting instructions.
-- Delegate work to subagents by default, including single-step tasks. Keep your own context for
-  planning, decisions and the user, so it stays clean and you stay responsive. Write each subagent
-  a precise brief, have a separate agent review every code change, and set the model on every
-  subagent explicitly.
+- Do small work yourself: a question, a lookup, a single command, an edit of a few lines in one or
+  two files. Delegate larger work to subagents: one writes the change from a precise brief, a
+  separate one reviews it.
+- Subagents cost tokens. Spawn as few as the task needs and set each one's model explicitly, one
+  tier below a top-tier (Fable) root. On such a root, warn the user once before a PR review or a
+  multi-agent task that it will be expensive.
 - Ask a needed decision when it comes up, with a recommendation. Do not re-ask settled ones.
 - Do not install toolchains or packages or change the machine setup without asking.
 - No `git stash`, avoid scratchpads filling up disk space.

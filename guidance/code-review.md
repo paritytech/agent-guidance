@@ -28,11 +28,21 @@ its repository, a project rule wins over this file.
 - Load the per-PR notes for {N} if they exist. Keep them in the harness's project memory or in an
   ignored directory in the repository.
 
+## Size and cost
+
+- Small diff (one area, up to about 200 changed lines): the session reads the diff, drafts, and
+  acts as the drafting agent in the steps below. No area agents. One fresh agent does the
+  independent review and the adversarial check from Claim verification. A self-review needs no
+  agent other than the bug pass on a top-tier root.
+- Larger diff: at most four area agents, one drafting agent, the two Claim verification agents.
+- Bug pass (3c): the built-in pass at an explicit level, low for a small diff, medium otherwise.
+  On a top-tier root, a lower-tier subagent briefed to hunt bugs instead: the built-in pass runs
+  on the session's model.
+- On a follow-up round, size the delta.
+
 ## Every round
 
-In a PR review the orchestrator launches the 3b area agents, the bug pass and the draft reviewers.
-One drafting agent gets their reports, reads the diff and verifies each finding itself. After
-sign-off the orchestrator runs Mechanics. The drafting agent may write the payload files into
+After sign-off the orchestrator runs Mechanics. The drafting agent may write the payload files into
 `{scratch}`.
 
 1. Gather (read-only). The PR description, `gh pr diff {N}`, the commits with head sha and
@@ -48,15 +58,15 @@ sign-off the orchestrator runs Mechanics. The drafting agent may write the paylo
    checklist covering every rule. The checklist is for the user only. Each concrete violation
    becomes an inline comment written as a plain engineering point that does not cite the guidance
    file.
-3. Investigate. All three parts are mandatory on every round, small PRs included, and each is done
+3. Investigate. 3a and 3c are mandatory on every round. 3b applies to larger diffs. Each is done
    before the draft is written.
    - 3a. The drafting agent reads the whole diff (or the whole delta on a follow-up) itself.
-   - 3b. The orchestrator launches area agents in parallel, one per area of the diff (for example
-     core logic, client or API side, tests, versioning). Each traces callers, interactions and
-     edge cases in depth and reports file:line evidence.
-   - 3c. The orchestrator runs the harness's built-in code review pass for bugs, never in a mode
-     that posts comments or applies fixes. On a follow-up, it runs on the delta range (last
-     reviewed sha to head).
+   - 3b. On a larger diff the orchestrator launches at most four area agents in parallel, one per
+     area of the diff (for example core logic, client or API side, tests, versioning). Each traces
+     callers, interactions and edge cases in depth and reports file:line evidence.
+   - 3c. The orchestrator runs the bug pass (see Size and cost), never in a mode that posts
+     comments or applies fixes. On a follow-up, it runs on the delta range (last reviewed sha to
+     head).
 
    The drafting agent verifies every finding from 3b and 3c against the code before it enters the
    draft. It drops what it cannot verify and says so in the draft.
@@ -74,8 +84,8 @@ sign-off the orchestrator runs Mechanics. The drafting agent may write the paylo
    user's stance, offer the variants first.
 
    The draft opens with a procedure checklist, one line per step 1 to 5, including 3a, 3b (areas
-   launched) and 3c (review pass ran, finding count). Finish every line before sign-off, and never
-   mark a line done that was not done.
+   launched, or skipped for a small diff) and 3c (bug pass ran, finding count). Finish every line
+   before sign-off, and never mark a line done that was not done.
 6. Sign-off. Nothing reaches GitHub before the user approves the draft. Show the full draft and
    wait for an explicit yes.
 7. Submit as one atomic review (see Mechanics), then resolve the approved threads.
@@ -305,7 +315,7 @@ to "approved, nothing open" plus any leftovers.
 Run the same procedure on your own branch before asking to open a PR:
 
 - Gather the diff against the base, the rules on every touched path, and the linked issue.
-- Do all three investigation parts (3a, 3b, 3c) and use the same lenses from "What to raise".
+- Do the investigation parts for the diff's size and use the same lenses from "What to raise".
 - Verify each finding against the code, then fix it in the branch with new commits. Nothing is
   drafted as a comment and nothing is posted.
 - A finding you decide not to fix goes into the PR description as a known limitation, or to the
